@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lint deps
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check src/ tests/ auto_loop.py evaluate.py agent_config.py
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]" || pip install pytest pytest-cov rich pydantic
+
+      - name: Run tests
+        env:
+          GOOGLE_CLOUD_PROJECT: test-project
+          GOOGLE_CLOUD_LOCATION: global
+          APP_NAME: test-app
+          LLM_PROVIDER: gemini
+          LLM_MODEL: gemini-2.0-flash
+          APPROVAL_MODE: auto
+        run: |
+          pytest tests/ -v --tb=short \
+            --ignore=tests/test_live.py \
+            --cov=src/auto_cxas_scrapi \
+            --cov-report=term-missing \
+            --cov-report=xml
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  security:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for secrets
+        run: |
+          # Block accidental credential commits
+          if grep -rE '(AKIA[A-Z0-9]{16}|AIza[0-9A-Za-z_-]{35})' \
+            --include='*.py' --include='*.yaml' --include='*.yml' \
+            --include='*.env' --include='*.json' \
+            --exclude-dir='.git' . ; then
+            echo 'Potential secret found! Blocking commit.'
+            exit 1
+          fi
+          echo 'No secrets detected.'
