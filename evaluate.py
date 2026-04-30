@@ -1,0 +1,216 @@
+"""
+evaluate.py — Fixed evaluation harness for auto-cxas-scrapi.
+
+THIS FILE IS READ-ONLY. The AI agent must NOT modify this file.
+It contains the golden test runner, latency probes, and metric computation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+EVAL_TIMEOUT_SECONDS: int = int(os.environ.get("AUTO_CXAS_EVAL_TIMEOUT_SECONDS", "120"))
+GOLDEN_TEST_FILE: Path = Path(__file__).parent / "golden_tests.yaml"
+STATE_DIR: Path = Path(os.environ.get("AUTO_CXAS_STATE_DIR", ".auto-cxas/state"))
+
+
+@dataclass
+class GoldenTest:
+    test_id: str
+    user_utterance: str
+    expected_intent: str
+    expected_response_contains: list[str] = field(default_factory=list)
+    max_latency_ms: int = 3000
+
+
+@dataclass
+class EvalResult:
+    eval_score: float = 0.0
+    task_success: float = 0.0
+    latency_ms_p50: int = 0
+    latency_ms_p95: int = 0
+    tool_error_rate: float = 0.0
+    golden_tests_run: int = 0
+    golden_tests_pass: int = 0
+    eval_seconds: float = 0.0
+    error: str = ""
+
+    def print_summary(self) -> None:
+        print("---")
+        print(f"eval_score:         {self.eval_score:.6f}")
+        print(f"task_success:       {self.task_success:.6f}")
+        print(f"latency_ms_p50:     {self.latency_ms_p50}")
+        print(f"latency_ms_p95:     {self.latency_ms_p95}")
+        print(f"tool_error_rate:    {self.tool_error_rate:.6f}")
+        print(f"golden_tests_run:   {self.golden_tests_run}")
+        print(f"golden_tests_pass:  {self.golden_tests_pass}")
+        print(f"eval_seconds:       {self.eval_seconds:.1f}")
+        if self.error:
+            print(f"error:              {self.error}")
+
+
+def _load_golden_tests() -> list[GoldenTest]:
+    if GOLDEN_TEST_FILE.exists():
+        try:
+            import yaml
+            raw = yaml.safe_load(GOLDEN_TEST_FILE.read_text("utf-8"))
+            return [GoldenTest(**t) for t in raw.get("tests", [])]
+        except Exception as exc:
+            print(f"[WARN] Could not load {GOLDEN_TEST_FILE}: {exc}")
+    return [
+        GoldenTest("gt_001", "What are your business hours?", "hours_inquiry",
+                   expected_response_contains=["hours", "open"]),
+        GoldenTest("gt_002", "I need to speak to a human agent", "escalation",
+                   expected_response_contains=["transfer", "agent"]),
+        GoldenTest("gt_003", "Can you reset my password?", "account_support",
+                   expected_response_contains=["password", "reset", "email"]),
+        GoldenTest("gt_004", "What is the status of my order?", "order_status",
+                   expected_response_contains=["order", "status", "track"]),
+        GoldenTest("gt_005", "Thank you, goodbye", "end_conversation",
+                   expected_response_contains=["thank", "goodbye", "help"]),
+        GoldenTest("gt_006", "How do I cancel my subscription?", "subscription_cancel",
+                   expected_response_contains=["cancel", "subscription"]),
+        GoldenTest("gt_007", "Where is my nearest store?", "store_locator",
+                   expected_response_contains=["store", "location", "near"]),
+        GoldenTest("gt_008", "I want a refund", "refund_request",
+                   expected_response_contains=["refund", "process", "days"]),
+    ]
+
+
+def _load_agent_config() -> dict[str, Any]:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "agent_config", Path(__file__).parent / "agent_config.py"
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("Cannot find agent_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return {k: getattr(module, k) for k in dir(module) if not k.startswith("_")}
+
+
+def _compute_eval_score(task_success: float, latency_ms_p95: int, tool_error_rate: float) -> float:
+    latency_score = max(0.0, 1.0 - min(latency_ms_p95 / 5000.0, 1.0))
+    reliability_score = max(0.0, 1.0 - min(tool_error_rate, 1.0))
+    return round(task_success * 0.60 + latency_score * 0.25 + reliability_score * 0.15, 6)
+
+
+def _percentile(values: list[float], p: int) -> int:
+    if not values:
+        return 0
+    sv = sorted(values)
+    idx = int(len(sv) * p / 100)
+    return int(sv[min(idx, len(sv) - 1)])
+
+
+def _run_dry(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, list[float], float]:
+    routing: dict = cfg.get("ROUTING_RULES", {})
+    instruction: str = cfg.get("SYSTEM_INSTRUCTION", "")
+    latencies: list[float] = []
+    passed = 0
+    for test in tests:
+        t = time.perf_counter()
+        ok = (test.expected_intent in routing) and len(instruction) > 50
+        latencies.append((time.perf_counter() - t) * 1000 + 700)
+        if ok:
+            passed += 1
+    return len(tests), passed, latencies, 0.0
+
+
+def _run_live(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, list[float], float]:
+    try:
+        from cxas_scrapi.evals.simulation_evals import SimulationEvals
+    except ImportError:
+        print("[WARN] cxas-scrapi unavailable -- dry-run fallback")
+        return _run_dry(tests, cfg)
+
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    app_name = os.environ.get("AUTO_CXAS_APP_NAME", "")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+
+    if not project_id or not app_name:
+        print("[WARN] Missing GCP env vars -- dry-run fallback")
+        return _run_dry(tests, cfg)
+
+    latencies: list[float] = []
+    passed = 0
+    tool_errors = 0
+
+    for test in tests:
+        t = time.perf_counter()
+        try:
+            sim = SimulationEvals(project_id=project_id, location=location, app_name=app_name)
+            resp = sim.run_single_turn(
+                user_utterance=test.user_utterance,
+                expected_intent=test.expected_intent,
+            )
+            elapsed = (time.perf_counter() - t) * 1000
+            latencies.append(elapsed)
+            ok = resp.get("intent_matched", False)
+            if test.expected_response_contains:
+                text = resp.get("response_text", "").lower()
+                ok = ok and all(kw.lower() in text for kw in test.expected_response_contains)
+            if ok:
+                passed += 1
+        except Exception as exc:
+            latencies.append((time.perf_counter() - t) * 1000)
+            tool_errors += 1
+            print(f"[WARN] {test.test_id}: {exc}")
+
+    ter = tool_errors / len(tests) if tests else 0.0
+    return len(tests), passed, latencies, ter
+
+
+def main(dry_run: bool = False, output_json: bool = False) -> EvalResult:
+    t0 = time.perf_counter()
+    result = EvalResult()
+
+    try:
+        cfg = _load_agent_config()
+    except Exception as exc:
+        result.error = str(exc)
+        result.print_summary()
+        return result
+
+    tests = _load_golden_tests()
+    total, passed, latencies, ter = _run_dry(tests, cfg) if dry_run else _run_live(tests, cfg)
+
+    result.golden_tests_run = total
+    result.golden_tests_pass = passed
+    result.task_success = passed / total if total else 0.0
+    result.latency_ms_p50 = _percentile(latencies, 50)
+    result.latency_ms_p95 = _percentile(latencies, 95)
+    result.tool_error_rate = ter
+    result.eval_seconds = time.perf_counter() - t0
+    result.eval_score = _compute_eval_score(result.task_success, result.latency_ms_p95, ter)
+
+    result.print_summary()
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    baseline_path = STATE_DIR / "baseline.json"
+    if not baseline_path.exists():
+        baseline_path.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+        print(f"\n[INFO] Baseline saved to {baseline_path}")
+
+    if output_json:
+        p = STATE_DIR / "last_result.json"
+        p.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+        print(f"[INFO] JSON written to {p}")
+
+    return result
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="auto-cxas-scrapi evaluation harness")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--output-json", action="store_true")
+    args = ap.parse_args()
+    res = main(dry_run=args.dry_run, output_json=args.output_json)
+    sys.exit(0 if not res.error else 1)
