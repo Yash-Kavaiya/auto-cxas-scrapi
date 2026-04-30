@@ -1,0 +1,60 @@
+tests:
+  - test_id: gt_001
+    user_utterance: "What are your business hours?"
+    expected_intent: hours_inquiry
+    expected_response_contains: [hours, open]
+    max_latency_ms: 2000
+
+  - test_id: gt_002
+    user_utterance: "I need to speak to a human agent"
+    expected_intent: escalation
+    expected_response_contains: [transfer, agent]
+    max_latency_ms: 2000
+
+  - test_id: gt_003
+    user_utterance: "Can you reset my password?"
+    expected_intent: account_support
+    expected_response_contains: [password, reset, email]
+    max_latency_ms: 2000
+
+  - test_id: gt_004
+    user_utterance: "What is the status of my order?"
+    expected_intent: order_status
+    expected_response_contains: [order, status, track]
+    max_latency_ms: 2000
+
+  - test_id: gt_005
+    user_utterance: "Thank you, goodbye"
+    expected_intent: end_conversation
+    expected_response_contains: [thank, goodbye, help]
+    max_latency_ms: 1500
+
+  - test_id: gt_006
+    user_utterance: "How do I cancel my subscription?"
+    expected_intent: subscription_cancel
+    expected_response_contains: [cancel, subscription]
+    max_latency_ms: 2500
+
+  - test_id: gt_007
+    user_utterance: "Where is my nearest store?"
+    expected_intent: store_locator
+    expected_response_contains: [store, location, near]
+    max_latency_ms: 2000
+
+  - test_id: gt_008
+    user_utterance: "I want a full refund for my order"
+    expected_intent: refund_request
+    expected_response_contains: [refund, process, days]
+    max_latency_ms: 2500
+
+  - test_id: gt_009
+    user_utterance: "This is not working at all, I am frustrated"
+    expected_intent: escalation
+    expected_response_contains: [agent, transfer]
+    max_latency_ms: 2000
+
+  - test_id: gt_010
+    user_utterance: "Are you open on weekends?"
+    expected_intent: hours_inquiry
+    expected_response_contains: [hours, open, weekend]
+    max_latency_ms: 2000
