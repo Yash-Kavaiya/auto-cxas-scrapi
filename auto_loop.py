@@ -243,6 +243,7 @@ def run_loop(
             n_discard += 1
             console.print("[red]DISCARD — no improvement. Reverted.[/red]")
 
+        desc = f"[{tag}] {candidate.title}" if tag else candidate.title
         _append_tsv(
             commit=exp_commit,
             eval_score=candidate_score,
@@ -250,7 +251,7 @@ def run_loop(
             latency_p95=latency_p95,
             tool_error_rate=tool_error_rate,
             status=status,
-            description=candidate.title,
+            description=desc,
         )
 
         console.print(

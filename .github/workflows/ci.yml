@@ -44,10 +44,10 @@ jobs:
         env:
           GOOGLE_CLOUD_PROJECT: test-project
           GOOGLE_CLOUD_LOCATION: global
-          APP_NAME: test-app
-          LLM_PROVIDER: gemini
-          LLM_MODEL: gemini-2.0-flash
-          APPROVAL_MODE: auto
+          AUTO_CXAS_APP_NAME: test-app
+          AUTO_CXAS_LLM_PROVIDER: gemini
+          AUTO_CXAS_LLM_MODEL: gemini-2.0-flash
+          AUTO_CXAS_APPROVAL_MODE: auto
         run: |
           pytest tests/ -v --tb=short \
             --ignore=tests/test_live.py \

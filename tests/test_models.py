@@ -23,3 +23,4 @@ def test_candidate_fields() -> None:
     )
     assert c.experiment_id == "exp-001"
     assert c.mutation["type"] == "prompt_patch"
+    assert c.new_agent_config_content == ""

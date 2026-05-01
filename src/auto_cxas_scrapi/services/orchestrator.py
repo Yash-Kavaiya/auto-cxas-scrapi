@@ -8,6 +8,7 @@ from rich.table import Table
 from auto_cxas_scrapi.adapters.llm.factory import get_llm_adapter
 from auto_cxas_scrapi.adapters.scrapi import ScrapiAdapter
 from auto_cxas_scrapi.config.settings import Settings
+from auto_cxas_scrapi.core.models import ExperimentCandidate, ExperimentResult, ExperimentStatus
 from auto_cxas_scrapi.memory.store import ExperimentStore
 from auto_cxas_scrapi.planners.llm_planner import LLMOptimizationPlanner
 from auto_cxas_scrapi.policies.promotion import PromotionPolicy
@@ -56,7 +57,7 @@ class AutoCXASOrchestrator:
         console.print_json(json.dumps(inv))
         return inv
 
-    def propose(self) -> list:
+    def propose(self) -> list[ExperimentCandidate]:
         context = {
             "app_name": self.settings.app_name,
             "project_id": self.settings.google_cloud_project,
@@ -66,9 +67,8 @@ class AutoCXASOrchestrator:
             self.store.save_candidate(c)
         return candidates
 
-    def run_experiment(self, experiment_id: str):
+    def run_experiment(self, experiment_id: str) -> ExperimentResult:
         data = self.store.load_candidate(experiment_id)
-        from auto_cxas_scrapi.core.models import ExperimentCandidate
         candidate = ExperimentCandidate(
             experiment_id=data["experiment_id"],
             title=data["title"],
@@ -83,7 +83,6 @@ class AutoCXASOrchestrator:
 
     def score_experiment(self, experiment_id: str) -> dict:
         result_data = self.store.load_result(experiment_id)
-        from auto_cxas_scrapi.core.models import ExperimentResult, ExperimentStatus
         result = ExperimentResult(
             experiment_id=result_data["experiment_id"],
             status=ExperimentStatus(result_data["status"]),

@@ -44,8 +44,9 @@ class LiveExperimentRunner(Runner):
             )
             artifacts: dict = {}
             if result_path.exists():
-                artifacts = json.loads(result_path.read_text("utf-8"))
-            status = ExperimentStatus.passed if not artifacts.get("error") else ExperimentStatus.failed
+                eval_result = json.loads(result_path.read_text("utf-8"))
+                artifacts = {"simulation_summary": eval_result}
+            status = ExperimentStatus.passed if not artifacts.get("simulation_summary", {}).get("error") else ExperimentStatus.failed
         except subprocess.TimeoutExpired:
             artifacts = {"error": "evaluate.py timed out"}
             status = ExperimentStatus.failed

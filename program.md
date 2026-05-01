@@ -90,7 +90,7 @@ In `--dry-run` mode all five proxy from `task_success`. In live mode, extend
 commit  eval_score  task_success  latency_ms_p95  tool_error_rate  status  description
 ```
 
-- `status`: `keep` | `discard` | `crash` | `baseline`
+- `status`: `keep` | `discard` | `crashed` | `baseline`
 - Append one row per experiment run, regardless of outcome.
 
 ## Safety Rules

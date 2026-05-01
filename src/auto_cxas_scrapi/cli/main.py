@@ -106,12 +106,16 @@ def promote(
 ) -> None:
     """Promote a passing experiment to the baseline state."""
     orch = _orch()
+    try:
+        result_data = orch.store.load_result(experiment_id)
+    except FileNotFoundError:
+        console.print(f"[red]No result found for {experiment_id}. Run `auto-cxas run {experiment_id}` first.[/red]")
+        raise typer.Exit(1)
     report = orch.score_experiment(experiment_id)
     if not report["policy"]["allowed"] and orch.settings.approval_mode == "manual":
         console.print("[red]Promotion blocked by policy. Review score output first.[/red]")
         raise typer.Exit(1)
     baseline_path = orch.settings.state_dir / "baseline.json"
-    result_data = orch.store.load_result(experiment_id)
     baseline_path.write_text(
         json.dumps({**result_data.get("artifacts", {}),
                     "eval_score": report["score"]}, indent=2),

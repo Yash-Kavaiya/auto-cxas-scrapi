@@ -19,6 +19,7 @@ from typing import Any
 EVAL_TIMEOUT_SECONDS: int = int(os.environ.get("AUTO_CXAS_EVAL_TIMEOUT_SECONDS", "120"))
 GOLDEN_TEST_FILE: Path = Path(__file__).parent / "golden_tests.yaml"
 STATE_DIR: Path = Path(os.environ.get("AUTO_CXAS_STATE_DIR", ".auto-cxas/state"))
+MIN_INSTRUCTION_LENGTH: int = 50
 
 
 @dataclass
@@ -119,7 +120,7 @@ def _run_dry(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, li
     passed = 0
     for test in tests:
         t = time.perf_counter()
-        ok = (test.expected_intent in routing) and len(instruction) > 50
+        ok = (test.expected_intent in routing) and len(instruction) > MIN_INSTRUCTION_LENGTH
         latencies.append((time.perf_counter() - t) * 1000 + 700)
         if ok:
             passed += 1
