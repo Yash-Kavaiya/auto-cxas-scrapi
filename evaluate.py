@@ -1,7 +1,7 @@
 """
 evaluate.py — Fixed evaluation harness for auto-cxas-scrapi.
 
-THIS FILE IS READ-ONLY. The AI agent must NOT modify this file.
+THIS FILE IS READ-ONLY for the AI optimization agent. Do NOT let the agent modify it.
 It contains the golden test runner, latency probes, and metric computation.
 """
 
@@ -41,6 +41,8 @@ class EvalResult:
     golden_tests_pass: int = 0
     eval_seconds: float = 0.0
     error: str = ""
+    # Per-eval-type pass rates read by LLMOptimizationPlanner to pick the weakest dimension.
+    metrics: dict = field(default_factory=dict)
 
     def print_summary(self) -> None:
         print("---")
@@ -124,48 +126,77 @@ def _run_dry(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, li
     return len(tests), passed, latencies, 0.0
 
 
-def _run_live(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, list[float], float]:
-    try:
-        from cxas_scrapi.evals.simulation_evals import SimulationEvals
-    except ImportError:
-        print("[WARN] cxas-scrapi unavailable -- dry-run fallback")
-        return _run_dry(tests, cfg)
+def _golden_to_simulation_case(test: GoldenTest) -> dict[str, Any]:
+    """Convert a GoldenTest to the SimulationEvals test case format."""
+    intent_label = test.expected_intent.replace("_", " ")
+    success_criteria = (
+        f"Agent handles the {intent_label} request and response includes: "
+        f"{', '.join(test.expected_response_contains)}"
+        if test.expected_response_contains
+        else f"Agent correctly handles the {intent_label} request"
+    )
+    return {
+        "name": test.test_id,
+        "steps": [
+            {
+                "goal": f"Get help with: {intent_label}",
+                "success_criteria": success_criteria,
+                "static_utterance": test.user_utterance,
+                "max_turns": 3,
+            }
+        ],
+        "expectations": (
+            [f"Response includes relevant information about: {', '.join(test.expected_response_contains)}"]
+            if test.expected_response_contains
+            else []
+        ),
+    }
 
+
+def _run_live(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, list[float], float]:
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     app_name = os.environ.get("AUTO_CXAS_APP_NAME", "")
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
     if not project_id or not app_name:
-        print("[WARN] Missing GCP env vars -- dry-run fallback")
+        print("[WARN] Missing GOOGLE_CLOUD_PROJECT or AUTO_CXAS_APP_NAME -- dry-run fallback")
         return _run_dry(tests, cfg)
 
-    latencies: list[float] = []
-    passed = 0
-    tool_errors = 0
+    try:
+        from cxas_scrapi import SimulationEvals  # type: ignore[import-untyped]
+    except ImportError:
+        print("[WARN] cxas-scrapi unavailable -- dry-run fallback")
+        return _run_dry(tests, cfg)
 
-    for test in tests:
-        t = time.perf_counter()
-        try:
-            sim = SimulationEvals(project_id=project_id, location=location, app_name=app_name)
-            resp = sim.run_single_turn(
-                user_utterance=test.user_utterance,
-                expected_intent=test.expected_intent,
-            )
-            elapsed = (time.perf_counter() - t) * 1000
-            latencies.append(elapsed)
-            ok = resp.get("intent_matched", False)
-            if test.expected_response_contains:
-                text = resp.get("response_text", "").lower()
-                ok = ok and all(kw.lower() in text for kw in test.expected_response_contains)
-            if ok:
-                passed += 1
-        except Exception as exc:
-            latencies.append((time.perf_counter() - t) * 1000)
-            tool_errors += 1
-            print(f"[WARN] {test.test_id}: {exc}")
+    # Full CES resource name required by SimulationEvals
+    full_app_name = f"projects/{project_id}/locations/{location}/apps/{app_name}"
+    test_cases = [_golden_to_simulation_case(t) for t in tests]
 
-    ter = tool_errors / len(tests) if tests else 0.0
-    return len(tests), passed, latencies, ter
+    t_start = time.perf_counter()
+    try:
+        sim = SimulationEvals(app_name=full_app_name)
+        results = sim.run_simulations(
+            test_cases=test_cases,
+            runs=1,
+            parallel=min(4, len(test_cases)),
+            verbose=False,
+        )
+    except Exception as exc:
+        print(f"[WARN] SimulationEvals failed: {exc} -- dry-run fallback")
+        return _run_dry(tests, cfg)
+
+    passed = sum(1 for r in results if r.get("passed", False))
+    latencies = [r.get("duration_s", 0.0) * 1000 for r in results]
+
+    # Probe tool error rate from detailed traces when available
+    tool_errors = sum(
+        1 for r in results
+        if any("error" in str(chunk).lower() for chunk in r.get("detailed_trace", []))
+    )
+    ter = tool_errors / len(results) if results else 0.0
+
+    _ = time.perf_counter() - t_start
+    return len(results), passed, latencies, ter
 
 
 def main(dry_run: bool = False, output_json: bool = False) -> EvalResult:
@@ -190,6 +221,18 @@ def main(dry_run: bool = False, output_json: bool = False) -> EvalResult:
     result.tool_error_rate = ter
     result.eval_seconds = time.perf_counter() - t0
     result.eval_score = _compute_eval_score(result.task_success, result.latency_ms_p95, ter)
+
+    # Per-eval-type metrics consumed by LLMOptimizationPlanner to target the weakest dimension.
+    # In dry-run all 5 types share the same simulation-based proxy score.
+    # In live mode, only simulation is exercised here; extend this block to run
+    # ToolEvals / TurnEvals / GuardrailEvals / CallbackEvals for full coverage.
+    result.metrics = {
+        "task_success": result.task_success,
+        "tool_pass_rate": result.task_success,
+        "turn_pass_rate": result.task_success,
+        "guardrail_pass_rate": result.task_success,
+        "callback_pass_rate": result.task_success,
+    }
 
     result.print_summary()
 
