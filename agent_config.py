@@ -34,14 +34,14 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 
 # Routing Rules
 ROUTING_RULES: dict[str, dict] = {
-    "hours_inquiry": {"confidence_threshold": 0.70, "priority": 2, "tool": None, "response_template": "hours_template"},
-    "escalation": {"confidence_threshold": 0.60, "priority": 10, "tool": "human_handoff", "response_template": "escalation_template"},
-    "account_support": {"confidence_threshold": 0.72, "priority": 4, "tool": "account_reset", "response_template": "account_template"},
-    "order_status": {"confidence_threshold": 0.75, "priority": 5, "tool": "order_lookup", "response_template": "order_template"},
-    "end_conversation": {"confidence_threshold": 0.65, "priority": 1, "tool": None, "response_template": "farewell_template"},
-    "refund_request": {"confidence_threshold": 0.73, "priority": 6, "tool": "refund_initiate", "response_template": "refund_template"},
-    "store_locator": {"confidence_threshold": 0.70, "priority": 3, "tool": "store_locator", "response_template": "store_template"},
-    "subscription_cancel": {"confidence_threshold": 0.75, "priority": 7, "tool": "subscription_manager", "response_template": "subscription_template"},
+    "hours_inquiry": {"confidence_threshold": 0.55, "priority": 2, "tool": None, "response_template": "hours_template"},
+    "escalation": {"confidence_threshold": 0.45, "priority": 10, "tool": "human_handoff", "response_template": "escalation_template"},
+    "account_support": {"confidence_threshold": 0.57, "priority": 4, "tool": "account_reset", "response_template": "account_template"},
+    "order_status": {"confidence_threshold": 0.60, "priority": 5, "tool": "order_lookup", "response_template": "order_template"},
+    "end_conversation": {"confidence_threshold": 0.50, "priority": 1, "tool": None, "response_template": "farewell_template"},
+    "refund_request": {"confidence_threshold": 0.58, "priority": 6, "tool": "refund_initiate", "response_template": "refund_template"},
+    "store_locator": {"confidence_threshold": 0.55, "priority": 3, "tool": "store_locator", "response_template": "store_template"},
+    "subscription_cancel": {"confidence_threshold": 0.60, "priority": 7, "tool": "subscription_manager", "response_template": "subscription_template"},
 }
 
 # Guardrail Parameters
