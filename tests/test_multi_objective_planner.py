@@ -1,4 +1,4 @@
-"""Tests for MultiObjectivePlanner."""
+"""Tests for MultiObjectivePlanner utility functions."""
 
 from __future__ import annotations
 
@@ -10,14 +10,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from auto_cxas_scrapi.planners.multi_objective_planner import MultiObjectivePlanner
+from auto_cxas_scrapi.planners.multi_objective_planner import (
+    MultiObjectivePlanner,
+    load_last_metrics,
+    rank_eval_types,
+)
 
 
 @pytest.fixture()
-def planner_with_metrics(tmp_path: Path) -> MultiObjectivePlanner:
+def state_with_metrics(tmp_path: Path) -> Path:
     state = tmp_path / "state"
     state.mkdir()
-    # tool_pass_rate is 0 -> should be proposed first
     (state / "last_result.json").write_text(json.dumps({
         "metrics": {
             "task_success": 0.90,
@@ -27,56 +30,24 @@ def planner_with_metrics(tmp_path: Path) -> MultiObjectivePlanner:
             "callback_pass_rate": 0.98,
         }
     }), encoding="utf-8")
-    return MultiObjectivePlanner(state_dir=state)
+    return state
 
 
 @pytest.fixture()
-def planner_no_metrics(tmp_path: Path) -> MultiObjectivePlanner:
+def state_empty(tmp_path: Path) -> Path:
     state = tmp_path / "state"
     state.mkdir()
-    return MultiObjectivePlanner(state_dir=state)
+    return state
 
 
-def test_propose_returns_candidates(planner_with_metrics) -> None:
-    candidates = planner_with_metrics.propose(n=3)
-    assert len(candidates) == 3
+def test_top_priority_eval(state_with_metrics: Path) -> None:
+    planner = MultiObjectivePlanner(state_dir=state_with_metrics)
+    assert planner.top_priority_eval() == "tool"  # lowest score (0.40)
 
 
-def test_propose_worst_first(planner_with_metrics) -> None:
-    candidates = planner_with_metrics.propose(n=5)
-    # tool_pass_rate=0.40 is worst -> should be priority 1
-    assert candidates[0].target_eval == "tool"
-    assert candidates[0].priority == 1
-
-
-def test_propose_respects_n(planner_with_metrics) -> None:
-    candidates = planner_with_metrics.propose(n=1)
-    assert len(candidates) == 1
-
-
-def test_propose_excludes_eval_type(planner_with_metrics) -> None:
-    candidates = planner_with_metrics.propose(n=5, exclude_eval_types=["tool"])
-    types = [c.target_eval for c in candidates]
-    assert "tool" not in types
-
-
-def test_candidate_has_required_fields(planner_with_metrics) -> None:
-    candidate = planner_with_metrics.propose(n=1)[0]
-    assert candidate.experiment_id.startswith("exp-")
-    assert candidate.title
-    assert candidate.hypothesis
-    assert candidate.mutation
-    assert isinstance(candidate.current_score, float)
-    assert candidate.priority >= 1
-
-
-def test_top_priority_eval(planner_with_metrics) -> None:
-    top = planner_with_metrics.top_priority_eval()
-    assert top == "tool"  # lowest score
-
-
-def test_score_summary_all_keys(planner_with_metrics) -> None:
-    summary = planner_with_metrics.score_summary()
+def test_score_summary_all_keys(state_with_metrics: Path) -> None:
+    planner = MultiObjectivePlanner(state_dir=state_with_metrics)
+    summary = planner.score_summary()
     expected_keys = {
         "task_success", "tool_pass_rate", "turn_pass_rate",
         "guardrail_pass_rate", "callback_pass_rate"
@@ -84,16 +55,28 @@ def test_score_summary_all_keys(planner_with_metrics) -> None:
     assert expected_keys == set(summary.keys())
 
 
-def test_no_metrics_defaults_to_zero(planner_no_metrics) -> None:
-    candidates = planner_no_metrics.propose(n=1)
-    # All metrics 0.0 -> sorted order depends on _EVAL_WEIGHTS definition
-    assert len(candidates) == 1
-    assert candidates[0].current_score == 0.0
+def test_rank_eval_types_worst_first(state_with_metrics: Path) -> None:
+    metrics = load_last_metrics(state_with_metrics)
+    ranked = rank_eval_types(metrics)
+    assert ranked[0][0] == "tool"  # tool_pass_rate=0.40 is worst
+    assert ranked[0][2] == pytest.approx(0.40)
 
 
-def test_candidate_to_dict(planner_with_metrics) -> None:
-    candidate = planner_with_metrics.propose(n=1)[0]
-    d = candidate.to_dict()
-    for key in ("experiment_id", "title", "hypothesis", "mutation",
-                "target_eval", "target_metric", "priority"):
-        assert key in d
+def test_rank_eval_types_no_metrics() -> None:
+    ranked = rank_eval_types({})
+    assert len(ranked) == 5
+    # All default to 0.0
+    for _, _, score in ranked:
+        assert score == 0.0
+
+
+def test_load_last_metrics_missing_file(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    assert load_last_metrics(state) == {}
+
+
+def test_load_last_metrics_returns_values(state_with_metrics: Path) -> None:
+    metrics = load_last_metrics(state_with_metrics)
+    assert metrics["tool_pass_rate"] == pytest.approx(0.40)
+    assert metrics["task_success"] == pytest.approx(0.90)

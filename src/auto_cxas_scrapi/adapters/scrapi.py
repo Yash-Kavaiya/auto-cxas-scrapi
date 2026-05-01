@@ -22,6 +22,12 @@ from rich.console import Console
 
 log = logging.getLogger(__name__)
 
+# Module-level imports so tests can patch these names with unittest.mock.patch().
+try:
+    from cxas_scrapi import Agents, Apps, SimulationEvals  # type: ignore[import-untyped]
+except ImportError:
+    Apps = Agents = SimulationEvals = None  # type: ignore[assignment]
+
 
 def _full_app_name(project_id: str, location: str, app_name: str) -> str:
     """Build the full CES resource name for an app."""
@@ -54,11 +60,7 @@ class ScrapiAdapter:
     # ------------------------------------------------------------------
 
     def is_available(self) -> bool:
-        try:
-            from cxas_scrapi import Apps  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        return Apps is not None
 
     @property
     def full_app_name(self) -> str:
@@ -84,8 +86,6 @@ class ScrapiAdapter:
             }
 
         try:
-            from cxas_scrapi import Apps, Agents  # type: ignore[import-untyped]
-
             # Apps takes (project_id, location)
             apps_client = Apps(
                 project_id=self.project_id,
@@ -130,9 +130,6 @@ class ScrapiAdapter:
             return {"lint_passed": False, "reason": "cxas-scrapi not installed"}
 
         try:
-            # cxas-scrapi does not yet expose a public run_lint(); we use
-            # a best-effort approach via Agents validation.
-            from cxas_scrapi import Agents  # type: ignore[import-untyped]
             agents = Agents(app_name=full)
             agents.list_agents()  # connectivity probe
             return {"lint_passed": True, "app": short}
@@ -176,9 +173,6 @@ class ScrapiAdapter:
             }
 
         try:
-            from cxas_scrapi import SimulationEvals  # type: ignore[import-untyped]
-
-            # SimulationEvals takes full app resource name
             sim = SimulationEvals(app_name=full)
             results = sim.run_simulations(
                 test_cases=cases,

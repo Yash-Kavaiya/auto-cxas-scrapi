@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 
 import typer
@@ -123,9 +124,20 @@ def promote(
 def rollback(
     experiment_id: str = typer.Argument(..., help="Experiment ID to roll back"),
 ) -> None:
-    """Revert an experiment by restoring the pre-experiment baseline."""
+    """Revert an experiment by resetting to HEAD~1."""
     console.print(f"[yellow]Rolling back {experiment_id}...[/yellow]")
-    console.print("Run: git reset --hard HEAD~1  (or to the specific pre-experiment commit)")
+    try:
+        subprocess.run(
+            ["git", "reset", "--hard", "HEAD~1"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        console.print("[green]Rollback complete.[/green]")
+    except subprocess.CalledProcessError as exc:
+        error = exc.stderr.strip() or exc.stdout.strip()
+        console.print(f"[red]Rollback failed: {error}[/red]")
+        raise typer.Exit(1)
 
 
 @app.command()

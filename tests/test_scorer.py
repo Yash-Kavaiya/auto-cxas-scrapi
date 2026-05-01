@@ -33,4 +33,4 @@ def test_typical_score_range() -> None:
     sc = scorer.score(_result(0.85, 1200, 0.02))
     assert 0.6 < sc.score < 1.0
     assert "task_success" in sc.metrics
-    assert "rationale" in sc.rationale
+    assert "score" in sc.rationale

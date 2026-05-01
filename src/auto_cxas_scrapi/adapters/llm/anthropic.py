@@ -5,7 +5,7 @@ from auto_cxas_scrapi.adapters.llm.base import LLMAdapter, LLMResponse
 
 
 class AnthropicAdapter(LLMAdapter):
-    DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
+    DEFAULT_MODEL = "claude-sonnet-4-6"
 
     def __init__(self, *, model: str = "", api_key: str = "") -> None:
         self.model = model or self.DEFAULT_MODEL

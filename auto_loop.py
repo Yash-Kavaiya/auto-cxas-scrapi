@@ -194,6 +194,11 @@ def run_loop(
         console.print(f"  Hypothesis: {candidate.hypothesis}")
         console.print(f"  Mutation  : {candidate.mutation}")
 
+        # --- Write new agent_config.py from planner ---
+        if candidate.new_agent_config_content:
+            Path("agent_config.py").write_text(candidate.new_agent_config_content, encoding="utf-8")
+            console.print("[dim]Wrote new agent_config.py from planner.[/dim]")
+
         # --- Commit mutation ---
         committed = _git_commit_agent_config(candidate.title)
         if not committed:

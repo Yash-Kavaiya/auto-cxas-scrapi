@@ -33,10 +33,8 @@ def test_full_app_name_already_full() -> None:
 
 def test_is_available_false_when_import_fails() -> None:
     adapter = ScrapiAdapter(project_id="proj", location="global", app_name="app")
-    with patch.dict(sys.modules, {"cxas_scrapi": None}):
-        # When the import raises ImportError, is_available must return False
-        with patch("builtins.__import__", side_effect=ImportError):
-            assert adapter.is_available() is False
+    with patch("auto_cxas_scrapi.adapters.scrapi.Apps", None):
+        assert adapter.is_available() is False
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Live experiment runner — applies mutations and runs real CXAS evals."""
+"""Live experiment runner — runs real CXAS evals against agent_config.py."""
 from __future__ import annotations
 import subprocess
 import sys
@@ -22,27 +22,18 @@ class LiveExperimentRunner(Runner):
         self.repo_root = repo_root or Path.cwd()
         self.state_dir = state_dir or self.repo_root / ".auto-cxas" / "state"
 
-    def _apply_mutation(self, candidate: ExperimentCandidate) -> bool:
-        mutation = candidate.mutation
-        config_path = self.repo_root / "agent_config.py"
-        if not config_path.exists():
-            return False
-        content = config_path.read_text("utf-8")
-        op = mutation.get("operation", "replace")
-        path = mutation.get("path", "")
-        value = mutation.get("value", "")
-        if op == "append" and path == "SYSTEM_INSTRUCTION":
-            content = content.replace(
-                'SYSTEM_INSTRUCTION: str = """',
-                f'SYSTEM_INSTRUCTION: str = """\n{value}',
-            )
-            config_path.write_text(content, "utf-8")
-            return True
-        return True
-
     def run(self, candidate: ExperimentCandidate) -> ExperimentResult:
         started = datetime.now(UTC)
-        self._apply_mutation(candidate)
+
+        config_path = self.repo_root / "agent_config.py"
+        if not config_path.exists():
+            return ExperimentResult(
+                experiment_id=candidate.experiment_id,
+                status=ExperimentStatus.failed,
+                artifacts={"error": "agent_config.py not found"},
+                started_at=started,
+                finished_at=datetime.now(UTC),
+            )
 
         result_path = self.state_dir / "last_result.json"
         cmd = [sys.executable, str(self.repo_root / "evaluate.py"), "--output-json"]

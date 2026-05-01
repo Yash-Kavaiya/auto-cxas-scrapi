@@ -31,6 +31,7 @@ class ExperimentCandidate:
     hypothesis: str
     target_resource: str
     mutation: dict[str, Any]
+    new_agent_config_content: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 

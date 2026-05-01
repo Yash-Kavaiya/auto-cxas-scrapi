@@ -9,7 +9,7 @@ from auto_cxas_scrapi.adapters.llm.factory import get_llm_adapter
 from auto_cxas_scrapi.adapters.scrapi import ScrapiAdapter
 from auto_cxas_scrapi.config.settings import Settings
 from auto_cxas_scrapi.memory.store import ExperimentStore
-from auto_cxas_scrapi.planners.llm_planner import LLMExperimentPlanner
+from auto_cxas_scrapi.planners.llm_planner import LLMOptimizationPlanner
 from auto_cxas_scrapi.policies.promotion import PromotionPolicy
 from auto_cxas_scrapi.runners.dry_run import DryRunExperimentRunner
 from auto_cxas_scrapi.runners.live_run import LiveExperimentRunner
@@ -31,7 +31,7 @@ class AutoCXASOrchestrator:
             provider=settings.llm_provider,
             model=settings.llm_model,
         )
-        self.planner = LLMExperimentPlanner(llm=self.llm)
+        self.planner = LLMOptimizationPlanner(llm=self.llm, state_dir=settings.state_dir)
         self.scorer = WeightedScorer()
         self.policy = PromotionPolicy(
             min_score_delta=settings.min_score_delta,
@@ -75,6 +75,7 @@ class AutoCXASOrchestrator:
             hypothesis=data["hypothesis"],
             target_resource=data["target_resource"],
             mutation=data["mutation"],
+            new_agent_config_content=data.get("new_agent_config_content", ""),
         )
         result = self.runner.run(candidate)
         self.store.save_result(result)

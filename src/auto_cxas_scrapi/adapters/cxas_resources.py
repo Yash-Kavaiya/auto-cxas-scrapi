@@ -11,6 +11,18 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Module-level imports so tests can patch these names with unittest.mock.patch().
+try:
+    from cxas_scrapi import (  # type: ignore[import-untyped]
+        Deployments,
+        Guardrails,
+        Tools,
+        Variables,
+        Versions,
+    )
+except ImportError:
+    Tools = Variables = Guardrails = Versions = Deployments = None  # type: ignore[assignment]
+
 
 class CXASResourcesAdapter:
     """Adapter for CXAS resource management (Tools, Variables, Guardrails,
@@ -23,11 +35,7 @@ class CXASResourcesAdapter:
         self.full_app_name = full_app_name
 
     def is_available(self) -> bool:
-        try:
-            from cxas_scrapi import Tools  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        return Tools is not None
 
     # ------------------------------------------------------------------
     # Tools
@@ -38,7 +46,6 @@ class CXASResourcesAdapter:
         if not self.is_available():
             return []
         try:
-            from cxas_scrapi import Tools  # type: ignore[import-untyped]
             client = Tools(app_name=self.full_app_name)
             raw = client.list_tools()
             return [
@@ -57,7 +64,6 @@ class CXASResourcesAdapter:
         if not self.is_available():
             return {}
         try:
-            from cxas_scrapi import Tools  # type: ignore[import-untyped]
             return Tools(app_name=self.full_app_name).get_tools_map(reverse=reverse)
         except Exception as exc:
             log.warning("get_tools_map failed: %s", exc)
@@ -73,7 +79,6 @@ class CXASResourcesAdapter:
         if not self.is_available():
             return {"available": False, "reason": "cxas-scrapi not installed"}
         try:
-            from cxas_scrapi import Tools  # type: ignore[import-untyped]
             client = Tools(app_name=self.full_app_name)
             result = client.execute_tool(
                 tool_display_name=tool_display_name,
@@ -94,7 +99,6 @@ class CXASResourcesAdapter:
         if not self.is_available():
             return []
         try:
-            from cxas_scrapi import Variables  # type: ignore[import-untyped]
             client = Variables(app_name=self.full_app_name)
             raw = client.list_variables()
             out = []
@@ -113,7 +117,6 @@ class CXASResourcesAdapter:
         if not self.is_available():
             return {}
         try:
-            from cxas_scrapi import Variables  # type: ignore[import-untyped]
             client = Variables(app_name=self.full_app_name)
             raw = client.list_variables()
             result: dict[str, Any] = {}
@@ -135,7 +138,6 @@ class CXASResourcesAdapter:
         if not self.is_available():
             return []
         try:
-            from cxas_scrapi import Guardrails  # type: ignore[import-untyped]
             client = Guardrails(app_name=self.full_app_name)
             raw = client.list_guardrails()
             return [
@@ -158,7 +160,6 @@ class CXASResourcesAdapter:
         if not self.is_available():
             return []
         try:
-            from cxas_scrapi import Versions  # type: ignore[import-untyped]
             client = Versions(app_name=self.full_app_name)
             raw = client.list_versions()
             return [
@@ -182,7 +183,6 @@ class CXASResourcesAdapter:
         if not self.is_available():
             return []
         try:
-            from cxas_scrapi import Deployments  # type: ignore[import-untyped]
             client = Deployments(app_name=self.full_app_name)
             raw = client.list_deployments()
             return [

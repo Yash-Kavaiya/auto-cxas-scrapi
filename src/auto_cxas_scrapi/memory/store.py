@@ -24,6 +24,7 @@ class ExperimentStore:
             "hypothesis": candidate.hypothesis,
             "target_resource": candidate.target_resource,
             "mutation": candidate.mutation,
+            "new_agent_config_content": candidate.new_agent_config_content,
             "created_at": candidate.created_at.isoformat(),
         }, indent=2), encoding="utf-8")
         return path
