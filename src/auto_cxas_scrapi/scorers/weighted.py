@@ -1,5 +1,6 @@
 """Multi-objective weighted scorer."""
 from __future__ import annotations
+
 from auto_cxas_scrapi.core.contracts import Scorer
 from auto_cxas_scrapi.core.models import ExperimentResult, ScoreCard
 

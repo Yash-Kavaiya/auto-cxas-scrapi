@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,8 +51,8 @@ class ReportGenerator:
 
         if scorecard:
             lines.append("## Score")
-            lines.append(f"| Metric | Value |")
-            lines.append(f"|--------|-------|")
+            lines.append("| Metric | Value |")
+            lines.append("|--------|-------|")
             lines.append(f"| **eval_score** | `{scorecard.get('score', 0):.6f}` |")
             for k, v in scorecard.get("metrics", {}).items():
                 if isinstance(v, float):

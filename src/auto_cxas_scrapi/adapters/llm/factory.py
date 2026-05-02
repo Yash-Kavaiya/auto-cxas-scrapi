@@ -1,5 +1,6 @@
 """LLM adapter factory — selects backend from AUTO_CXAS_LLM_PROVIDER."""
 from __future__ import annotations
+
 from auto_cxas_scrapi.adapters.llm.base import LLMAdapter
 
 

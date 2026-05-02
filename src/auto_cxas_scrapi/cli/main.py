@@ -110,7 +110,7 @@ def promote(
         result_data = orch.store.load_result(experiment_id)
     except FileNotFoundError:
         console.print(f"[red]No result found for {experiment_id}. Run `auto-cxas run {experiment_id}` first.[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     report = orch.score_experiment(experiment_id)
     if not report["policy"]["allowed"] and orch.settings.approval_mode == "manual":
         console.print("[red]Promotion blocked by policy. Review score output first.[/red]")
@@ -141,7 +141,7 @@ def rollback(
     except subprocess.CalledProcessError as exc:
         error = exc.stderr.strip() or exc.stdout.strip()
         console.print(f"[red]Rollback failed: {error}[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from exc
 
 
 @app.command()

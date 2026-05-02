@@ -1,6 +1,8 @@
 """Gemini / Vertex AI LLM adapter."""
 from __future__ import annotations
+
 import os
+
 from auto_cxas_scrapi.adapters.llm.base import LLMAdapter, LLMResponse
 
 

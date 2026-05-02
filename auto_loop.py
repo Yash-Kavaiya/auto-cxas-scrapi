@@ -23,7 +23,7 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console

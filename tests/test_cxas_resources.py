@@ -31,9 +31,11 @@ def test_list_tools_mocked() -> None:
     mock_client = MagicMock()
     mock_client.list_tools.return_value = [mock_tool]
 
-    with patch.object(adapter, "is_available", return_value=True):
-        with patch("auto_cxas_scrapi.adapters.cxas_resources.Tools", return_value=mock_client):
-            tools = adapter.list_tools()
+    with (
+        patch.object(adapter, "is_available", return_value=True),
+        patch("auto_cxas_scrapi.adapters.cxas_resources.Tools", return_value=mock_client),
+    ):
+        tools = adapter.list_tools()
 
     assert len(tools) == 1
     assert tools[0]["display_name"] == "Order Lookup"

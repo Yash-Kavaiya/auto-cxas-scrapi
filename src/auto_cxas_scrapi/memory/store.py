@@ -1,9 +1,16 @@
 """Experiment artifact store and run journal."""
 from __future__ import annotations
+
 import json
 from pathlib import Path
 from typing import Any
-from auto_cxas_scrapi.core.models import ExperimentCandidate, ExperimentResult, ExperimentStatus, ScoreCard
+
+from auto_cxas_scrapi.core.models import (
+    ExperimentCandidate,
+    ExperimentResult,
+    ExperimentStatus,
+    ScoreCard,
+)
 
 
 class ExperimentStore:

@@ -6,12 +6,9 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from auto_cxas_scrapi.adapters.scrapi import ScrapiAdapter, _full_app_name
-
 
 # ---------------------------------------------------------------------------
 # _full_app_name helper
@@ -58,10 +55,12 @@ def test_get_inventory_available() -> None:
     mock_agents = MagicMock()
     mock_agents.get_agents_map.return_value = {"projects/proj/locations/global/apps/app/agents/a1": "Agent 1"}
 
-    with patch.object(adapter, "is_available", return_value=True):
-        with patch("auto_cxas_scrapi.adapters.scrapi.Apps", return_value=mock_apps):
-            with patch("auto_cxas_scrapi.adapters.scrapi.Agents", return_value=mock_agents):
-                inv = adapter.get_inventory()
+    with (
+        patch.object(adapter, "is_available", return_value=True),
+        patch("auto_cxas_scrapi.adapters.scrapi.Apps", return_value=mock_apps),
+        patch("auto_cxas_scrapi.adapters.scrapi.Agents", return_value=mock_agents),
+    ):
+        inv = adapter.get_inventory()
 
     assert inv["available"] is True
     assert inv["apps_count"] == 1
@@ -103,9 +102,11 @@ def test_run_simulation_eval_aggregates() -> None:
 
     test_cases = [{"name": "tc1"}, {"name": "tc2"}, {"name": "tc3"}]
 
-    with patch.object(adapter, "is_available", return_value=True):
-        with patch("auto_cxas_scrapi.adapters.scrapi.SimulationEvals", return_value=mock_sim):
-            result = adapter.run_simulation_eval(test_cases=test_cases)
+    with (
+        patch.object(adapter, "is_available", return_value=True),
+        patch("auto_cxas_scrapi.adapters.scrapi.SimulationEvals", return_value=mock_sim),
+    ):
+        result = adapter.run_simulation_eval(test_cases=test_cases)
 
     assert result["available"] is True
     assert result["total"] == 3

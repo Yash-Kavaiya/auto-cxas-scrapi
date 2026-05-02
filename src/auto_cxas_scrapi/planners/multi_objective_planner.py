@@ -40,7 +40,7 @@ def load_last_metrics(state_dir: Path) -> dict[str, float]:
     try:
         data = json.loads(result_path.read_text("utf-8"))
         metrics = data.get("metrics", {})
-        return {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
+        return {k: float(v) for k, v in metrics.items() if isinstance(v, int | float)}
     except Exception as exc:
         log.warning("Failed to load last_result.json: %s", exc)
         return {}

@@ -1,7 +1,8 @@
 """Main orchestration service — wires all components together."""
 from __future__ import annotations
+
 import json
-from pathlib import Path
+
 from rich.console import Console
 from rich.table import Table
 

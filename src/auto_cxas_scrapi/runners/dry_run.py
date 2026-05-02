@@ -1,6 +1,8 @@
 """Dry-run experiment runner — no live CXAS calls."""
 from __future__ import annotations
-from datetime import datetime, UTC
+
+from datetime import UTC, datetime
+
 from auto_cxas_scrapi.core.contracts import Runner
 from auto_cxas_scrapi.core.models import ExperimentCandidate, ExperimentResult, ExperimentStatus
 
