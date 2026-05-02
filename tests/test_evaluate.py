@@ -79,3 +79,74 @@ def test_golden_to_callback_case_skips_no_tool() -> None:
     mod = _load_evaluate()
     test = mod.GoldenTest("t1", "goodbye", "end_conversation")
     assert mod._golden_to_callback_case(test, {"end_conversation": {}}) is None
+
+
+def test_run_live_calls_all_five_adapters(tmp_path, monkeypatch) -> None:
+    """_run_live delegates to CXASEvalsAdapter and returns real per-type metrics."""
+    mod = _load_evaluate()
+
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj")
+    monkeypatch.setenv("AUTO_CXAS_APP_NAME", "myapp")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+    sim_result = {
+        "available": True, "pass_rate": 0.8, "total": 5, "passed": 4,
+        "raw": [{"duration_s": 1.0, "passed": True}] * 4 + [{"duration_s": 1.0, "passed": False}],
+    }
+    tool_result = {"available": True, "pass_rate": 0.75}
+    turn_result = {"available": True, "pass_rate": 0.90}
+    guardrail_result = {"available": True, "pass_rate": 1.0}
+    callback_result = {"available": True, "pass_rate": 0.85}
+
+    class FakeAdapter:
+        def __init__(self, *, full_app_name): pass
+        def is_available(self): return True
+        def run_simulation_evals(self, cases, **kw): return sim_result
+        def run_tool_evals(self, cases, **kw): return tool_result
+        def run_turn_evals(self, cases, **kw): return turn_result
+        def run_guardrail_evals(self, cases, **kw): return guardrail_result
+        def run_callback_evals(self, cases, **kw): return callback_result
+
+    import auto_cxas_scrapi.adapters.cxas_evals as cxas_mod
+    monkeypatch.setattr(cxas_mod, "CXASEvalsAdapter", FakeAdapter)
+
+    tests = [
+        mod.GoldenTest("t1", "hello", "hours_inquiry"),
+        mod.GoldenTest("t2", "reset pw", "account_support"),
+    ]
+    cfg = {
+        "ROUTING_RULES": {
+            "hours_inquiry": {"tool": None},
+            "account_support": {"tool": "account_reset"},
+        },
+        "SYSTEM_INSTRUCTION": "x" * 60,
+    }
+    total, passed, latencies, ter, metrics = mod._run_live(tests, cfg)
+
+    assert total == 5
+    assert passed == 4
+    assert metrics["task_success"] == pytest.approx(0.8)
+    assert metrics["tool_pass_rate"] == pytest.approx(0.75)
+    assert metrics["turn_pass_rate"] == pytest.approx(0.90)
+    assert metrics["guardrail_pass_rate"] == pytest.approx(1.0)
+    assert metrics["callback_pass_rate"] == pytest.approx(0.85)
+    assert ter == pytest.approx(0.25)  # 1.0 - tool_pass_rate
+
+
+def test_main_dry_run_end_to_end(tmp_path, monkeypatch) -> None:
+    """main(dry_run=True) writes last_result.json with all 5 metric keys."""
+    mod = _load_evaluate()
+    monkeypatch.setattr(mod, "STATE_DIR", tmp_path / "state")
+
+    result = mod.main(dry_run=True, output_json=True)
+
+    assert result.error == ""
+    assert result.eval_score > 0
+    assert set(result.metrics) == {
+        "task_success", "tool_pass_rate", "turn_pass_rate",
+        "guardrail_pass_rate", "callback_pass_rate",
+    }
+    last = (tmp_path / "state" / "last_result.json").read_text("utf-8")
+    data = __import__("json").loads(last)
+    assert "metrics" in data
+    assert "task_success" in data["metrics"]
