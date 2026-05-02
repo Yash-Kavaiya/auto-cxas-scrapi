@@ -1,1 +1,3 @@
 commit	eval_score	task_success	latency_ms_p95	tool_error_rate	status	description
+838350c	0.965000	1.000000	700	0.000000	discard	tighten SYSTEM_INSTRUCTION with explicit rules and sentence limits
+dd116da	0.965000	1.000000	700	0.000000	discard	reduce max_fallback_turns to 1 to improve latency
