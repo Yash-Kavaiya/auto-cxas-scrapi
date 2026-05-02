@@ -113,19 +113,9 @@ def _percentile(values: list[float], p: int) -> int:
     return int(sv[min(idx, len(sv) - 1)])
 
 
-def _run_dry(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, list[float], float]:
-    routing: dict = cfg.get("ROUTING_RULES", {})
-    instruction: str = cfg.get("SYSTEM_INSTRUCTION", "")
-    latencies: list[float] = []
-    passed = 0
-    for test in tests:
-        t = time.perf_counter()
-        ok = (test.expected_intent in routing) and len(instruction) > MIN_INSTRUCTION_LENGTH
-        latencies.append((time.perf_counter() - t) * 1000 + 700)
-        if ok:
-            passed += 1
-    return len(tests), passed, latencies, 0.0
-
+# ---------------------------------------------------------------------------
+# Dataset converters — one per eval type
+# ---------------------------------------------------------------------------
 
 def _golden_to_simulation_case(test: GoldenTest) -> dict[str, Any]:
     """Convert a GoldenTest to the SimulationEvals test case format."""
@@ -154,7 +144,87 @@ def _golden_to_simulation_case(test: GoldenTest) -> dict[str, Any]:
     }
 
 
-def _run_live(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, list[float], float]:
+def _golden_to_tool_case(test: GoldenTest, routing: dict) -> dict[str, Any] | None:
+    """Convert to ToolEvals format; returns None if the intent has no tool."""
+    tool = routing.get(test.expected_intent, {}).get("tool")
+    if not tool:
+        return None
+    return {
+        "name": test.test_id,
+        "utterance": test.user_utterance,
+        "expected_tool_use": [{"name": tool}],
+        "success_criteria": f"Agent invokes the {tool} tool to handle: {test.expected_intent}",
+    }
+
+
+def _golden_to_turn_case(test: GoldenTest) -> dict[str, Any]:
+    """Convert to TurnEvals single-turn format."""
+    criteria = (
+        f"Response includes relevant information about: {', '.join(test.expected_response_contains)}"
+        if test.expected_response_contains
+        else f"Response appropriately addresses the {test.expected_intent.replace('_', ' ')} request"
+    )
+    return {
+        "name": test.test_id,
+        "conversation": [{"role": "user", "content": test.user_utterance}],
+        "success_criteria": criteria,
+    }
+
+
+def _golden_to_guardrail_case(test: GoldenTest) -> dict[str, Any]:
+    """Convert to GuardrailEvals format — golden tests are legitimate and must NOT be blocked."""
+    return {
+        "name": test.test_id,
+        "utterance": test.user_utterance,
+        "should_be_blocked": False,
+        "success_criteria": (
+            f"Legitimate {test.expected_intent.replace('_', ' ')} request passes guardrail checks"
+        ),
+    }
+
+
+def _golden_to_callback_case(test: GoldenTest, routing: dict) -> dict[str, Any] | None:
+    """Convert to CallbackEvals format; returns None if the intent has no tool callback."""
+    tool = routing.get(test.expected_intent, {}).get("tool")
+    if not tool:
+        return None
+    return {
+        "name": test.test_id,
+        "trigger_utterance": test.user_utterance,
+        "expected_callback": {"name": tool},
+        "success_criteria": f"Callback {tool} correctly triggered for {test.expected_intent}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Runners
+# ---------------------------------------------------------------------------
+
+_EvalTuple = tuple[int, int, list[float], float, dict[str, float]]
+
+
+def _run_dry(tests: list[GoldenTest], cfg: dict[str, Any]) -> _EvalTuple:
+    routing: dict = cfg.get("ROUTING_RULES", {})
+    instruction: str = cfg.get("SYSTEM_INSTRUCTION", "")
+    latencies: list[float] = []
+    passed = 0
+    for test in tests:
+        t = time.perf_counter()
+        ok = (test.expected_intent in routing) and len(instruction) > MIN_INSTRUCTION_LENGTH
+        latencies.append((time.perf_counter() - t) * 1000 + 700)
+        if ok:
+            passed += 1
+    ts = passed / len(tests) if tests else 0.0
+    return len(tests), passed, latencies, 0.0, {
+        "task_success": ts,
+        "tool_pass_rate": ts,
+        "turn_pass_rate": ts,
+        "guardrail_pass_rate": ts,
+        "callback_pass_rate": ts,
+    }
+
+
+def _run_live(tests: list[GoldenTest], cfg: dict[str, Any]) -> _EvalTuple:
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     app_name = os.environ.get("AUTO_CXAS_APP_NAME", "")
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
@@ -164,41 +234,68 @@ def _run_live(tests: list[GoldenTest], cfg: dict[str, Any]) -> tuple[int, int, l
         return _run_dry(tests, cfg)
 
     try:
-        from cxas_scrapi import SimulationEvals  # type: ignore[import-untyped]
+        from auto_cxas_scrapi.adapters.cxas_evals import CXASEvalsAdapter
     except ImportError:
+        print("[WARN] auto-cxas-scrapi package unavailable -- dry-run fallback")
+        return _run_dry(tests, cfg)
+
+    full_app_name = f"projects/{project_id}/locations/{location}/apps/{app_name}"
+    adapter = CXASEvalsAdapter(full_app_name=full_app_name)
+
+    if not adapter.is_available():
         print("[WARN] cxas-scrapi unavailable -- dry-run fallback")
         return _run_dry(tests, cfg)
 
-    # Full CES resource name required by SimulationEvals
-    full_app_name = f"projects/{project_id}/locations/{location}/apps/{app_name}"
-    test_cases = [_golden_to_simulation_case(t) for t in tests]
+    routing: dict = cfg.get("ROUTING_RULES", {})
 
-    t_start = time.perf_counter()
-    try:
-        sim = SimulationEvals(app_name=full_app_name)
-        results = sim.run_simulations(
-            test_cases=test_cases,
-            runs=1,
-            parallel=min(4, len(test_cases)),
-            verbose=False,
-        )
-    except Exception as exc:
-        print(f"[WARN] SimulationEvals failed: {exc} -- dry-run fallback")
+    # SimulationEvals — task_success and latency anchor
+    sim_cases = [_golden_to_simulation_case(t) for t in tests]
+    sim = adapter.run_simulation_evals(
+        sim_cases, runs=1, parallel=min(4, len(sim_cases)), verbose=False
+    )
+    if not sim.get("available"):
+        print(f"[WARN] SimulationEvals failed: {sim.get('error')} -- dry-run fallback")
         return _run_dry(tests, cfg)
 
-    passed = sum(1 for r in results if r.get("passed", False))
-    latencies = [r.get("duration_s", 0.0) * 1000 for r in results]
+    sim_pr = float(sim.get("pass_rate", 0.0))
+    latencies = [r.get("duration_s", 0.0) * 1000 for r in sim.get("raw", [])]
 
-    # Probe tool error rate from detailed traces when available
-    tool_errors = sum(
-        1 for r in results
-        if any("error" in str(chunk).lower() for chunk in r.get("detailed_trace", []))
+    # ToolEvals — only for intents that map to a tool
+    tool_cases = [c for t in tests if (c := _golden_to_tool_case(t, routing))]
+    tool_res = adapter.run_tool_evals(tool_cases) if tool_cases else {}
+    tool_pr = float(tool_res["pass_rate"]) if tool_res.get("available") else sim_pr
+
+    # TurnEvals — all golden tests as single-turn conversations
+    turn_res = adapter.run_turn_evals(
+        [_golden_to_turn_case(t) for t in tests], model="gemini-2.0-flash"
     )
-    ter = tool_errors / len(results) if results else 0.0
+    turn_pr = float(turn_res["pass_rate"]) if turn_res.get("available") else sim_pr
 
-    _ = time.perf_counter() - t_start
-    return len(results), passed, latencies, ter
+    # GuardrailEvals — all golden tests must pass (none should be blocked)
+    guardrail_res = adapter.run_guardrail_evals(
+        [_golden_to_guardrail_case(t) for t in tests]
+    )
+    guardrail_pr = float(guardrail_res["pass_rate"]) if guardrail_res.get("available") else sim_pr
 
+    # CallbackEvals — only for intents that trigger a callback tool
+    callback_cases = [c for t in tests if (c := _golden_to_callback_case(t, routing))]
+    callback_res = adapter.run_callback_evals(callback_cases) if callback_cases else {}
+    callback_pr = float(callback_res["pass_rate"]) if callback_res.get("available") else sim_pr
+
+    metrics: dict[str, float] = {
+        "task_success": sim_pr,
+        "tool_pass_rate": tool_pr,
+        "turn_pass_rate": turn_pr,
+        "guardrail_pass_rate": guardrail_pr,
+        "callback_pass_rate": callback_pr,
+    }
+    ter = 1.0 - tool_pr
+    return sim.get("total", len(tests)), sim.get("passed", 0), latencies, ter, metrics
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main(dry_run: bool = False, output_json: bool = False) -> EvalResult:
     t0 = time.perf_counter()
@@ -212,7 +309,9 @@ def main(dry_run: bool = False, output_json: bool = False) -> EvalResult:
         return result
 
     tests = _load_golden_tests()
-    total, passed, latencies, ter = _run_dry(tests, cfg) if dry_run else _run_live(tests, cfg)
+    total, passed, latencies, ter, eval_metrics = (
+        _run_dry(tests, cfg) if dry_run else _run_live(tests, cfg)
+    )
 
     result.golden_tests_run = total
     result.golden_tests_pass = passed
@@ -222,18 +321,7 @@ def main(dry_run: bool = False, output_json: bool = False) -> EvalResult:
     result.tool_error_rate = ter
     result.eval_seconds = time.perf_counter() - t0
     result.eval_score = _compute_eval_score(result.task_success, result.latency_ms_p95, ter)
-
-    # Per-eval-type metrics consumed by LLMOptimizationPlanner to target the weakest dimension.
-    # In dry-run all 5 types share the same simulation-based proxy score.
-    # In live mode, only simulation is exercised here; extend this block to run
-    # ToolEvals / TurnEvals / GuardrailEvals / CallbackEvals for full coverage.
-    result.metrics = {
-        "task_success": result.task_success,
-        "tool_pass_rate": result.task_success,
-        "turn_pass_rate": result.task_success,
-        "guardrail_pass_rate": result.task_success,
-        "callback_pass_rate": result.task_success,
-    }
+    result.metrics = eval_metrics
 
     result.print_summary()
 
