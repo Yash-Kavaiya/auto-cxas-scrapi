@@ -1,0 +1,66 @@
+# cloudrun.yaml — Cloud Run Job definition for auto-cxas-scrapi.
+#
+# Deploy:
+#   gcloud run jobs replace cloudrun.yaml --region=us-central1
+#
+# Execute one-shot:
+#   gcloud run jobs execute auto-cxas-scrapi --region=us-central1
+#
+# Replace PROJECT_ID and ensure these secrets exist in Secret Manager:
+#   auto-cxas-app-name, auto-cxas-gcs-bucket
+
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: auto-cxas-scrapi
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+    spec:
+      parallelism: 1
+      completions: 1
+      template:
+        spec:
+          timeoutSeconds: 86400
+          serviceAccountName: auto-cxas-scrapi@PROJECT_ID.iam.gserviceaccount.com
+          containers:
+            - image: gcr.io/PROJECT_ID/auto-cxas-scrapi:latest
+              args:
+                - "--max-experiments"
+                - "200"
+                - "--ema"
+              env:
+                - name: GOOGLE_CLOUD_PROJECT
+                  value: PROJECT_ID
+                - name: GOOGLE_CLOUD_LOCATION
+                  value: global
+                - name: AUTO_CXAS_APP_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      key: latest
+                      name: auto-cxas-app-name
+                - name: AUTO_CXAS_APPROVAL_MODE
+                  value: auto
+                - name: AUTO_CXAS_GENERATE_HTML_REPORT
+                  value: "true"
+                - name: AUTO_CXAS_REPORT_DIR
+                  value: /tmp/reports
+                - name: AUTO_CXAS_GCS_RESULTS_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      key: latest
+                      name: auto-cxas-gcs-bucket
+              resources:
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+              volumeMounts:
+                - name: reports
+                  mountPath: /tmp/reports
+          volumes:
+            - name: reports
+              emptyDir: {}
