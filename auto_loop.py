@@ -2,16 +2,13 @@
 """
 auto_loop.py — Autonomous experiment loop for auto-cxas-scrapi.
 
-This is the standalone script that runs the full
-  propose → commit → eval → keep/discard
-loop indefinitely (or up to --max-experiments).
-
 Usage::
 
     python auto_loop.py                          # default
     python auto_loop.py --dry-run                # no live CXAS calls
     python auto_loop.py --max-experiments 20     # stop after 20
     python auto_loop.py --tag "sprint-42"        # label runs in results.tsv
+    python auto_loop.py --ema                    # EMA-smoothed baseline (reduces noise)
 
 See program.md for the full strategy guide.
 """
@@ -26,6 +23,7 @@ import time
 from datetime import datetime, UTC
 from pathlib import Path
 
+import git as _git
 from rich.console import Console
 from rich.rule import Rule
 
@@ -36,6 +34,7 @@ from auto_cxas_scrapi.services.orchestrator import AutoCXASOrchestrator
 console = Console()
 RESULTS_TSV = Path("results.tsv")
 TSV_HEADER = "commit\teval_score\ttask_success\tlatency_ms_p95\ttool_error_rate\tstatus\tdescription\ttimestamp\n"
+EMA_BETA: float = 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -66,59 +65,57 @@ def _append_tsv(
         fh.write(row)
 
 
+def _get_repo() -> _git.Repo:
+    return _git.Repo(search_parent_directories=True)
+
+
 def _git_commit_hash() -> str:
-    """Return the current HEAD commit short hash."""
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            text=True,
-        ).strip()
+        return _get_repo().head.commit.hexsha[:7]
     except Exception:
         return "unknown"
 
 
 def _git_commit_agent_config(description: str) -> bool:
-    """Stage agent_config.py and commit.  Returns True on success."""
+    """Stage agent_config.py and create a commit. Returns True on success."""
     try:
-        subprocess.run(
-            ["git", "add", "agent_config.py"],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", f"exp: {description}"],
-            check=True, capture_output=True,
-        )
+        repo = _get_repo()
+        repo.index.add(["agent_config.py"])
+        if not repo.index.diff("HEAD"):
+            return False
+        repo.index.commit(f"exp: {description}")
         return True
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[yellow]git commit failed: {exc.stderr.decode().strip()}[/yellow]")
+    except _git.GitCommandError as exc:
+        console.print(f"[yellow]git commit failed: {exc}[/yellow]")
+        return False
+    except Exception as exc:
+        console.print(f"[yellow]git commit failed: {exc}[/yellow]")
         return False
 
 
 def _git_reset_last_commit() -> None:
-    """Undo the last commit (keep working tree clean)."""
+    """Soft-reset the last commit then restore agent_config.py to HEAD."""
     try:
-        subprocess.run(
-            ["git", "reset", "--hard", "HEAD~1"],
-            check=True, capture_output=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]git reset failed: {exc.stderr.decode().strip()}[/red]")
+        repo = _get_repo()
+        repo.git.reset("--soft", "HEAD~1")
+        repo.git.checkout("--", "agent_config.py")
+    except Exception as exc:
+        console.print(f"[red]git reset failed: {exc}[/red]")
 
 
 def _run_evaluate(dry_run: bool) -> dict:
-    """Run evaluate.py and return parsed metrics."""
+    """Run evaluate.py in a subprocess and return parsed metrics."""
     cmd = [sys.executable, "evaluate.py", "--output-json"]
     if dry_run:
         cmd.append("--dry-run")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        state_dir = Path(".auto-cxas/state")
-        result_path = state_dir / "last_result.json"
+        subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        result_path = Path(".auto-cxas/state") / "last_result.json"
         if result_path.exists():
             return json.loads(result_path.read_text("utf-8"))
         return {"eval_score": 0.0, "task_success": 0.0,
                 "latency_ms_p95": 9999, "tool_error_rate": 1.0,
-                "error": proc.stderr.strip()}
+                "error": "last_result.json not written"}
     except subprocess.TimeoutExpired:
         return {"eval_score": 0.0, "error": "evaluate.py timed out"}
     except Exception as exc:
@@ -135,6 +132,7 @@ def run_loop(
     max_experiments: int = 1000,
     dry_run: bool = False,
     sleep_between: float = 2.0,
+    use_ema: bool = False,
 ) -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
@@ -147,9 +145,9 @@ def run_loop(
     console.print(f"  llm     : {settings.llm_provider}/{settings.llm_model or 'auto'}")
     console.print(f"  mode    : {settings.approval_mode}  dry_run={dry_run}")
     console.print(f"  max_exp : {max_experiments}  tag={tag or 'none'}")
+    console.print(f"  ema     : {use_ema} (beta={EMA_BETA})")
     console.print(Rule())
 
-    # Capture baseline once
     baseline_score = orch.get_baseline_score()
     if baseline_score == 0.0:
         console.print("[yellow]No baseline found. Running initial evaluation...[/yellow]")
@@ -167,15 +165,13 @@ def run_loop(
         )
         console.print(f"[green]Baseline: {baseline_score:.6f}[/green]")
 
-    n_exp = 0
-    n_keep = 0
-    n_discard = 0
+    smoothed_baseline = baseline_score
+    n_exp = n_keep = n_discard = 0
 
     while n_exp < max_experiments:
         n_exp += 1
         console.print(Rule(f"[dim]Experiment {n_exp}/{max_experiments}[/dim]"))
 
-        # --- Propose ---
         try:
             candidates = orch.propose()
         except Exception as exc:
@@ -194,12 +190,10 @@ def run_loop(
         console.print(f"  Hypothesis: {candidate.hypothesis}")
         console.print(f"  Mutation  : {candidate.mutation}")
 
-        # --- Write new agent_config.py from planner ---
         if candidate.new_agent_config_content:
             Path("agent_config.py").write_text(candidate.new_agent_config_content, encoding="utf-8")
             console.print("[dim]Wrote new agent_config.py from planner.[/dim]")
 
-        # --- Commit mutation ---
         committed = _git_commit_agent_config(candidate.title)
         if not committed:
             console.print("[yellow]Nothing to commit (no diff). Skipping.[/yellow]")
@@ -208,26 +202,28 @@ def run_loop(
 
         exp_commit = _git_commit_hash()
 
-        # --- Evaluate ---
         console.print("[dim]Running evaluate.py...[/dim]")
         metrics = _run_evaluate(dry_run)
         candidate_score = metrics.get("eval_score", 0.0)
-        task_success = metrics.get("task_success", 0.0)
-        latency_p95 = metrics.get("latency_ms_p95", 0)
+        task_success    = metrics.get("task_success", 0.0)
+        latency_p95     = metrics.get("latency_ms_p95", 0)
         tool_error_rate = metrics.get("tool_error_rate", 0.0)
 
-        delta = candidate_score - baseline_score
+        compare_baseline = smoothed_baseline if use_ema else baseline_score
+        delta = candidate_score - compare_baseline
         console.print(
             f"  [bold]score[/bold]={candidate_score:.6f}  "
-            f"baseline={baseline_score:.6f}  "
+            f"baseline={compare_baseline:.6f}  "
             f"delta={delta:+.6f}"
         )
 
-        # --- Keep / Discard ---
         improved = delta >= settings.min_score_delta
         if improved and settings.approval_mode == "auto":
             status = "keep"
-            baseline_score = candidate_score
+            if use_ema:
+                smoothed_baseline = EMA_BETA * smoothed_baseline + (1 - EMA_BETA) * candidate_score
+            else:
+                baseline_score = candidate_score
             n_keep += 1
             console.print("[green]KEEP — score improved.[/green]")
         elif improved and settings.approval_mode == "manual":
@@ -253,18 +249,15 @@ def run_loop(
             status=status,
             description=desc,
         )
-
-        console.print(
-            f"  [dim]keep={n_keep}  discard={n_discard}  "
-            f"total={n_exp}[/dim]"
-        )
+        console.print(f"  [dim]keep={n_keep}  discard={n_discard}  total={n_exp}[/dim]")
         time.sleep(sleep_between)
 
     console.print(Rule("[bold green]Loop complete[/bold green]"))
     console.print(f"  experiments : {n_exp}")
     console.print(f"  keep        : {n_keep}")
     console.print(f"  discard     : {n_discard}")
-    console.print(f"  final score : {baseline_score:.6f}")
+    final = smoothed_baseline if use_ema else baseline_score
+    console.print(f"  final score : {final:.6f}")
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +275,8 @@ def _parse_args() -> argparse.Namespace:
                     help="Use dry-run evaluate.py (no live CXAS calls)")
     ap.add_argument("--sleep", type=float, default=2.0,
                     help="Seconds between experiments")
+    ap.add_argument("--ema", action="store_true",
+                    help="EMA-smooth the baseline score to reduce eval noise")
     return ap.parse_args()
 
 
@@ -293,6 +288,7 @@ if __name__ == "__main__":
             max_experiments=args.max_experiments,
             dry_run=args.dry_run,
             sleep_between=args.sleep,
+            use_ema=args.ema,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
