@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime, UTC
 from pathlib import Path
 
@@ -122,6 +123,43 @@ def _run_evaluate(dry_run: bool) -> dict:
         return {"eval_score": 0.0, "error": str(exc)}
 
 
+def _is_converged(window: deque, threshold: float) -> bool:
+    """Return True when window is full and score range is below threshold."""
+    if len(window) < window.maxlen:  # type: ignore[arg-type]
+        return False
+    return (max(window) - min(window)) < threshold
+
+
+def _maybe_generate_report(settings) -> None:
+    """Generate HTML report if enabled in settings."""
+    if not settings.generate_html_report:
+        return
+    try:
+        from auto_cxas_scrapi.reporting.html_report import generate
+        out = generate(results_tsv=RESULTS_TSV, report_dir=settings.report_dir)
+        console.print(f"[dim]HTML report → {out}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]HTML report failed: {exc}[/yellow]")
+
+
+def _maybe_export_gcs(settings) -> None:
+    """Upload results.tsv to GCS bucket if configured."""
+    bucket = getattr(settings, "gcs_results_bucket", "")
+    if not bucket or not RESULTS_TSV.exists():
+        return
+    try:
+        from google.cloud import storage as gcs
+        client = gcs.Client()
+        blob_name = (
+            f"auto-cxas-scrapi/{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}/results.tsv"
+        )
+        blob = gcs.Blob(blob_name, gcs.Bucket(client, bucket))
+        blob.upload_from_filename(str(RESULTS_TSV))
+        console.print(f"[dim]Uploaded results.tsv → gs://{bucket}/{blob_name}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]GCS export failed: {exc}[/yellow]")
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -140,12 +178,16 @@ def run_loop(
     _ensure_results_tsv()
 
     console.print(Rule("[bold cyan]auto-cxas-scrapi autonomous loop[/bold cyan]"))
-    console.print(f"  project : {settings.google_cloud_project or '[yellow]NOT SET[/yellow]'}")
-    console.print(f"  app     : {settings.app_name or '[yellow]NOT SET[/yellow]'}")
-    console.print(f"  llm     : {settings.llm_provider}/{settings.llm_model or 'auto'}")
-    console.print(f"  mode    : {settings.approval_mode}  dry_run={dry_run}")
-    console.print(f"  max_exp : {max_experiments}  tag={tag or 'none'}")
-    console.print(f"  ema     : {use_ema} (beta={EMA_BETA})")
+    console.print(f"  project     : {settings.google_cloud_project or '[yellow]NOT SET[/yellow]'}")
+    console.print(f"  app         : {settings.app_name or '[yellow]NOT SET[/yellow]'}")
+    console.print(f"  llm         : {settings.llm_provider}/{settings.llm_model or 'auto'}")
+    console.print(f"  mode        : {settings.approval_mode}  dry_run={dry_run}")
+    console.print(f"  max_exp     : {max_experiments}  tag={tag or 'none'}")
+    console.print(f"  ema         : {use_ema} (beta={EMA_BETA})")
+    console.print(
+        f"  convergence : window={settings.convergence_window}  "
+        f"threshold={settings.convergence_threshold}"
+    )
     console.print(Rule())
 
     baseline_score = orch.get_baseline_score()
@@ -167,6 +209,7 @@ def run_loop(
 
     smoothed_baseline = baseline_score
     n_exp = n_keep = n_discard = 0
+    score_window: deque[float] = deque(maxlen=settings.convergence_window)
 
     while n_exp < max_experiments:
         n_exp += 1
@@ -191,7 +234,9 @@ def run_loop(
         console.print(f"  Mutation  : {candidate.mutation}")
 
         if candidate.new_agent_config_content:
-            Path("agent_config.py").write_text(candidate.new_agent_config_content, encoding="utf-8")
+            Path("agent_config.py").write_text(
+                candidate.new_agent_config_content, encoding="utf-8"
+            )
             console.print("[dim]Wrote new agent_config.py from planner.[/dim]")
 
         committed = _git_commit_agent_config(candidate.title)
@@ -221,7 +266,9 @@ def run_loop(
         if improved and settings.approval_mode == "auto":
             status = "keep"
             if use_ema:
-                smoothed_baseline = EMA_BETA * smoothed_baseline + (1 - EMA_BETA) * candidate_score
+                smoothed_baseline = (
+                    EMA_BETA * smoothed_baseline + (1 - EMA_BETA) * candidate_score
+                )
             else:
                 baseline_score = candidate_score
             n_keep += 1
@@ -239,6 +286,8 @@ def run_loop(
             n_discard += 1
             console.print("[red]DISCARD — no improvement. Reverted.[/red]")
 
+        score_window.append(candidate_score)
+
         desc = f"[{tag}] {candidate.title}" if tag else candidate.title
         _append_tsv(
             commit=exp_commit,
@@ -250,6 +299,15 @@ def run_loop(
             description=desc,
         )
         console.print(f"  [dim]keep={n_keep}  discard={n_discard}  total={n_exp}[/dim]")
+
+        if _is_converged(score_window, settings.convergence_threshold):
+            console.print(
+                f"[bold yellow]CONVERGED[/bold yellow] — last "
+                f"{settings.convergence_window} experiments span < "
+                f"{settings.convergence_threshold:.4f}. Stopping."
+            )
+            break
+
         time.sleep(sleep_between)
 
     console.print(Rule("[bold green]Loop complete[/bold green]"))
@@ -258,6 +316,9 @@ def run_loop(
     console.print(f"  discard     : {n_discard}")
     final = smoothed_baseline if use_ema else baseline_score
     console.print(f"  final score : {final:.6f}")
+
+    _maybe_generate_report(settings)
+    _maybe_export_gcs(settings)
 
 
 # ---------------------------------------------------------------------------
