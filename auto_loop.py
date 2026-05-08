@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime, UTC
 from pathlib import Path
 
@@ -33,12 +34,15 @@ from auto_cxas_scrapi.services.orchestrator import AutoCXASOrchestrator
 
 console = Console()
 RESULTS_TSV = Path("results.tsv")
-TSV_HEADER = "commit\teval_score\ttask_success\tlatency_ms_p95\ttool_error_rate\tstatus\tdescription\ttimestamp\n"
+TSV_HEADER = (
+    "commit\teval_score\ttask_success\tlatency_ms_p95\t"
+    "tool_error_rate\tstatus\tdescription\ttimestamp\n"
+)
 EMA_BETA: float = 0.7
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# TSV helpers
 # ---------------------------------------------------------------------------
 
 def _ensure_results_tsv() -> None:
@@ -65,6 +69,10 @@ def _append_tsv(
         fh.write(row)
 
 
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
 def _get_repo() -> _git.Repo:
     return _git.Repo(search_parent_directories=True)
 
@@ -85,9 +93,6 @@ def _git_commit_agent_config(description: str) -> bool:
             return False
         repo.index.commit(f"exp: {description}")
         return True
-    except _git.GitCommandError as exc:
-        console.print(f"[yellow]git commit failed: {exc}[/yellow]")
-        return False
     except Exception as exc:
         console.print(f"[yellow]git commit failed: {exc}[/yellow]")
         return False
@@ -103,6 +108,10 @@ def _git_reset_last_commit() -> None:
         console.print(f"[red]git reset failed: {exc}[/red]")
 
 
+# ---------------------------------------------------------------------------
+# Evaluate helper
+# ---------------------------------------------------------------------------
+
 def _run_evaluate(dry_run: bool) -> dict:
     """Run evaluate.py in a subprocess and return parsed metrics."""
     cmd = [sys.executable, "evaluate.py", "--output-json"]
@@ -113,13 +122,81 @@ def _run_evaluate(dry_run: bool) -> dict:
         result_path = Path(".auto-cxas/state") / "last_result.json"
         if result_path.exists():
             return json.loads(result_path.read_text("utf-8"))
-        return {"eval_score": 0.0, "task_success": 0.0,
-                "latency_ms_p95": 9999, "tool_error_rate": 1.0,
-                "error": "last_result.json not written"}
+        return {
+            "eval_score": 0.0, "task_success": 0.0,
+            "latency_ms_p95": 9999, "tool_error_rate": 1.0,
+            "error": "last_result.json not written",
+        }
     except subprocess.TimeoutExpired:
         return {"eval_score": 0.0, "error": "evaluate.py timed out"}
     except Exception as exc:
         return {"eval_score": 0.0, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Convergence detection
+# ---------------------------------------------------------------------------
+
+def _is_converged(window: deque, threshold: float) -> bool:
+    """Return True when window is full and score range is below threshold."""
+    if len(window) < window.maxlen:  # type: ignore[arg-type]
+        return False
+    return (max(window) - min(window)) < threshold
+
+
+# ---------------------------------------------------------------------------
+# Mutation diversity tracking
+# ---------------------------------------------------------------------------
+
+def _record_mutation(mutation: dict, state_dir: Path, diversity_window: int) -> None:
+    """Append mutation type to mutation_history.json, keeping last N entries."""
+    history_path = state_dir / "mutation_history.json"
+    history: list[dict] = []
+    if history_path.exists():
+        try:
+            history = json.loads(history_path.read_text("utf-8"))
+        except Exception:
+            pass
+    history.append({
+        "type": mutation.get("type", "unknown"),
+        "path": mutation.get("path", ""),
+        "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    history = history[-diversity_window:]
+    state_dir.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Post-loop output helpers
+# ---------------------------------------------------------------------------
+
+def _maybe_generate_report(settings) -> None:
+    if not settings.generate_html_report:
+        return
+    try:
+        from auto_cxas_scrapi.reporting.html_report import generate
+        out = generate(results_tsv=RESULTS_TSV, report_dir=settings.report_dir)
+        console.print(f"[dim]HTML report → {out}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]HTML report failed: {exc}[/yellow]")
+
+
+def _maybe_export_gcs(settings) -> None:
+    bucket = getattr(settings, "gcs_results_bucket", "")
+    if not bucket or not RESULTS_TSV.exists():
+        return
+    try:
+        from google.cloud import storage as gcs
+        client = gcs.Client()
+        blob_name = (
+            f"auto-cxas-scrapi/{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}/results.tsv"
+        )
+        blob = gcs.Blob(blob_name, gcs.Bucket(client, bucket))
+        blob.upload_from_filename(str(RESULTS_TSV))
+        console.print(f"[dim]Uploaded results.tsv → gs://{bucket}/{blob_name}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]GCS export failed: {exc}[/yellow]")
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +215,22 @@ def run_loop(
     configure_logging(settings.log_level)
     orch = AutoCXASOrchestrator(settings)
     _ensure_results_tsv()
+    state_dir = Path(settings.state_dir)
 
     console.print(Rule("[bold cyan]auto-cxas-scrapi autonomous loop[/bold cyan]"))
-    console.print(f"  project : {settings.google_cloud_project or '[yellow]NOT SET[/yellow]'}")
-    console.print(f"  app     : {settings.app_name or '[yellow]NOT SET[/yellow]'}")
-    console.print(f"  llm     : {settings.llm_provider}/{settings.llm_model or 'auto'}")
-    console.print(f"  mode    : {settings.approval_mode}  dry_run={dry_run}")
-    console.print(f"  max_exp : {max_experiments}  tag={tag or 'none'}")
-    console.print(f"  ema     : {use_ema} (beta={EMA_BETA})")
+    console.print(f"  project     : {settings.google_cloud_project or '[yellow]NOT SET[/yellow]'}")
+    console.print(f"  app         : {settings.app_name or '[yellow]NOT SET[/yellow]'}")
+    console.print(f"  llm         : {settings.llm_provider}/{settings.llm_model or 'auto'}")
+    console.print(f"  mode        : {settings.approval_mode}  dry_run={dry_run}")
+    console.print(f"  max_exp     : {max_experiments}  tag={tag or 'none'}")
+    console.print(f"  ema         : {use_ema} (beta={EMA_BETA})")
+    console.print(
+        f"  convergence : window={settings.convergence_window}  "
+        f"threshold={settings.convergence_threshold}"
+    )
+    console.print(
+        f"  diversity   : window={settings.diversity_window} mutation types tracked"
+    )
     console.print(Rule())
 
     baseline_score = orch.get_baseline_score()
@@ -167,6 +252,7 @@ def run_loop(
 
     smoothed_baseline = baseline_score
     n_exp = n_keep = n_discard = 0
+    score_window: deque[float] = deque(maxlen=settings.convergence_window)
 
     while n_exp < max_experiments:
         n_exp += 1
@@ -185,13 +271,16 @@ def run_loop(
             continue
 
         candidate = candidates[0]
+        mut_type = candidate.mutation.get("type", "unknown") if candidate.mutation else "unknown"
         console.print(f"[cyan]Candidate:[/cyan] {candidate.experiment_id}")
         console.print(f"  Title     : {candidate.title}")
         console.print(f"  Hypothesis: {candidate.hypothesis}")
-        console.print(f"  Mutation  : {candidate.mutation}")
+        console.print(f"  Mutation  : {candidate.mutation}  ({mut_type})")
 
         if candidate.new_agent_config_content:
-            Path("agent_config.py").write_text(candidate.new_agent_config_content, encoding="utf-8")
+            Path("agent_config.py").write_text(
+                candidate.new_agent_config_content, encoding="utf-8"
+            )
             console.print("[dim]Wrote new agent_config.py from planner.[/dim]")
 
         committed = _git_commit_agent_config(candidate.title)
@@ -221,7 +310,9 @@ def run_loop(
         if improved and settings.approval_mode == "auto":
             status = "keep"
             if use_ema:
-                smoothed_baseline = EMA_BETA * smoothed_baseline + (1 - EMA_BETA) * candidate_score
+                smoothed_baseline = (
+                    EMA_BETA * smoothed_baseline + (1 - EMA_BETA) * candidate_score
+                )
             else:
                 baseline_score = candidate_score
             n_keep += 1
@@ -239,6 +330,12 @@ def run_loop(
             n_discard += 1
             console.print("[red]DISCARD — no improvement. Reverted.[/red]")
 
+        # Record mutation type for diversity tracking
+        if candidate.mutation:
+            _record_mutation(candidate.mutation, state_dir, settings.diversity_window)
+
+        score_window.append(candidate_score)
+
         desc = f"[{tag}] {candidate.title}" if tag else candidate.title
         _append_tsv(
             commit=exp_commit,
@@ -250,6 +347,15 @@ def run_loop(
             description=desc,
         )
         console.print(f"  [dim]keep={n_keep}  discard={n_discard}  total={n_exp}[/dim]")
+
+        if _is_converged(score_window, settings.convergence_threshold):
+            console.print(
+                f"[bold yellow]CONVERGED[/bold yellow] — last "
+                f"{settings.convergence_window} experiments span < "
+                f"{settings.convergence_threshold:.4f}. Stopping."
+            )
+            break
+
         time.sleep(sleep_between)
 
     console.print(Rule("[bold green]Loop complete[/bold green]"))
@@ -258,6 +364,9 @@ def run_loop(
     console.print(f"  discard     : {n_discard}")
     final = smoothed_baseline if use_ema else baseline_score
     console.print(f"  final score : {final:.6f}")
+
+    _maybe_generate_report(settings)
+    _maybe_export_gcs(settings)
 
 
 # ---------------------------------------------------------------------------

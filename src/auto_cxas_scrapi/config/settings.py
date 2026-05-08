@@ -32,15 +32,19 @@ class Settings(BaseSettings):
     baseline_cache_ttl_seconds: int = Field(
         default=300, alias="AUTO_CXAS_BASELINE_CACHE_TTL_SECONDS"
     )
-    # Convergence detection (autoresearch-inspired)
+    # Convergence detection
     convergence_window: int = Field(default=10, alias="AUTO_CXAS_CONVERGENCE_WINDOW")
     convergence_threshold: float = Field(default=0.002, alias="AUTO_CXAS_CONVERGENCE_THRESHOLD")
+    # Mutation diversity enforcement
+    diversity_window: int = Field(default=5, alias="AUTO_CXAS_DIVERSITY_WINDOW")
     # Callback server
     callback_server_url: str = Field(default="", alias="AUTO_CXAS_CALLBACK_SERVER_URL")
     callback_secret: str = Field(default="", alias="AUTO_CXAS_CALLBACK_SECRET")
     # Reporting
     generate_html_report: bool = Field(default=False, alias="AUTO_CXAS_GENERATE_HTML_REPORT")
     report_dir: Path = Field(default=Path(".auto-cxas/reports"), alias="AUTO_CXAS_REPORT_DIR")
+    # GCS export
+    gcs_results_bucket: str = Field(default="", alias="AUTO_CXAS_GCS_RESULTS_BUCKET")
 
     def ensure_directories(self) -> None:
         self.runs_dir.mkdir(parents=True, exist_ok=True)

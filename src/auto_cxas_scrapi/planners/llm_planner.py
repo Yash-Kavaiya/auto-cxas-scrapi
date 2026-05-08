@@ -13,6 +13,16 @@ from auto_cxas_scrapi.planners.multi_objective_planner import load_last_metrics,
 
 log = logging.getLogger(__name__)
 
+_ALL_MUTATION_TYPES = [
+    "prompt_patch",
+    "config_update",
+    "threshold_tune",
+    "template_change",
+    "callback_tune",
+    "cache_tune",
+    "variable_tune",
+]
+
 _SYSTEM_PROMPT = """\
 You are an expert Google Cloud CX Agent Studio optimization researcher.
 Given the current agent_config.py and results history, propose ONE targeted
@@ -43,20 +53,20 @@ Mutable variables in agent_config.py and their primary impact:
   VARIABLES (session state scoping)             → task_success
 
 You MUST output ONLY valid JSON with this exact schema — no markdown fences, no extra text:
-{
+{{
   "title": "Short experiment title",
   "hypothesis": "What you expect to happen and why",
   "target_eval": "simulation|tool|turn|guardrail|callback",
   "target_metric": "the metric key being improved",
-  "mutation": {
+  "mutation": {{
     "type": "prompt_patch|config_update|threshold_tune|template_change|callback_tune|cache_tune|variable_tune",
     "path": "VARIABLE.key",
     "operation": "replace|append|prepend|adjust",
     "value": "<new value or delta>",
     "rationale": "Why this specific change"
-  },
+  }},
   "new_agent_config_content": "# complete valid Python text for agent_config.py"
-}
+}}
 
 The new_agent_config_content field MUST contain the full, valid Python source
 for agent_config.py with your proposed mutation already applied.
@@ -72,10 +82,12 @@ class LLMOptimizationPlanner(Planner):
         llm: LLMAdapter,
         repo_root: Path | None = None,
         state_dir: Path | None = None,
+        diversity_window: int = 5,
     ) -> None:
         self.llm = llm
         self.repo_root = repo_root or Path.cwd()
         self.state_dir = state_dir or self.repo_root / ".auto-cxas" / "state"
+        self.diversity_window = diversity_window
 
     def propose(self, *, context: dict) -> list[ExperimentCandidate]:
         target_eval, target_metric, current_score = self._find_weakest_eval()
@@ -85,10 +97,12 @@ class LLMOptimizationPlanner(Planner):
 
         agent_config = self._read_agent_config()
         results_history = self._read_results_history()
+        diversity_note = self._build_diversity_note()
 
         user_prompt = (
             f"WEAKEST EVAL: {target_eval} ({target_metric} = {current_score:.3f})\n"
-            f"Target this eval dimension in your proposed mutation.\n\n"
+            f"Target this eval dimension in your proposed mutation.\n"
+            f"{diversity_note}\n"
             f"Current agent_config.py:\n```python\n{agent_config}\n```\n\n"
             f"Recent results (results.tsv):\n```\n{results_history}\n```\n\n"
             f"App context: {json.dumps(context, indent=2)}\n\n"
@@ -121,6 +135,47 @@ class LLMOptimizationPlanner(Planner):
         except Exception as exc:
             log.warning("LLM proposal failed: %s — using fallback", exc)
             return self._fallback_propose(context, target_eval)
+
+    # ------------------------------------------------------------------
+    # Diversity helpers
+    # ------------------------------------------------------------------
+
+    def _read_mutation_history(self) -> list[dict]:
+        p = self.state_dir / "mutation_history.json"
+        if not p.exists():
+            return []
+        try:
+            return json.loads(p.read_text("utf-8"))
+        except Exception:
+            return []
+
+    def _build_diversity_note(self) -> str:
+        history = self._read_mutation_history()
+        if not history:
+            return ""
+        recent_types = [h["type"] for h in history]
+        counts = {t: recent_types.count(t) for t in set(recent_types)}
+        # Find types NOT recently tried
+        untried = [t for t in _ALL_MUTATION_TYPES if t not in counts]
+        note = (
+            f"\nMUTATION DIVERSITY GUIDANCE (last {len(history)} experiments):\n"
+            f"  Recently used: {counts}\n"
+        )
+        if untried:
+            note += (
+                f"  Preferred (not recently tried): {untried}\n"
+                f"  STRONGLY PREFER one of the above types to maximise search diversity.\n"
+            )
+        else:
+            least = min(counts, key=lambda t: counts[t])
+            note += (
+                f"  All types tried recently. Prefer the least-used: '{least}'\n"
+            )
+        return note
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
 
     def _find_weakest_eval(self) -> tuple[str, str, float]:
         ranked = rank_eval_types(load_last_metrics(self.state_dir))
@@ -155,14 +210,21 @@ class LLMOptimizationPlanner(Planner):
     def _fallback_propose(
         self, context: dict, target_eval: str
     ) -> list[ExperimentCandidate]:
+        history = self._read_mutation_history()
+        recent_types = {h["type"] for h in history}
+        # Pick a mutation type not recently tried
+        fallback_type = next(
+            (t for t in _ALL_MUTATION_TYPES if t not in recent_types),
+            "prompt_patch",
+        )
         clarity_rule = "Always confirm user intent before any irreversible action."
         agent_config = self._read_agent_config()
         mutation = {
-            "type": "prompt_patch",
+            "type": fallback_type,
             "path": "SYSTEM_INSTRUCTION",
             "operation": "append",
             "value": clarity_rule,
-            "rationale": f"Fallback: clarity improvement targeting {target_eval}",
+            "rationale": f"Fallback ({fallback_type}): clarity improvement targeting {target_eval}",
         }
         new_content = self._patch_agent_config(agent_config, mutation)
         return [ExperimentCandidate(
