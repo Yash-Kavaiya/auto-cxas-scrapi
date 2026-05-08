@@ -8,6 +8,8 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 [![CI](https://github.com/Yash-Kavaiya/auto-cxas-scrapi/actions/workflows/ci.yml/badge.svg)](https://github.com/Yash-Kavaiya/auto-cxas-scrapi/actions/workflows/ci.yml)
 
+📚 **[Full Documentation](docs/index.md)** &nbsp;·&nbsp; [Architecture](docs/architecture.md) &nbsp;·&nbsp; [Configuration](docs/configuration.md) &nbsp;·&nbsp; [Deployment](docs/deployment.md)
+
 ---
 
 ## What it does
@@ -17,27 +19,99 @@ that continuously improves your CXAS agent configuration without human intervent
 between experiments. It targets the weakest eval dimension each iteration and stops
 automatically when the score window converges.
 
+```mermaid
+flowchart TD
+    A([🚀 Start]) --> B[Load baseline score]
+    B --> C[MultiObjectivePlanner\nranks weakest eval dimension]
+    C --> D[LLM Planner\nproposes mutation]
+    D --> E[Patch agent_config.py\n+ git commit]
+    E --> F[evaluate.py\nall 5 evals in parallel]
+    F --> G{eval_score >\nbaseline + min_delta?}
+    G -->|✅ Keep| H[EMA-update baseline\nβ = 0.7]
+    G -->|❌ Discard| I[git reset --soft HEAD~1]
+    H --> J[Record mutation type\nto mutation_history.json]
+    I --> J
+    J --> K[Append row to results.tsv]
+    K --> L{Converged or\nmax experiments?}
+    L -->|No| C
+    L -->|Yes| M[Generate HTML report]
+    M --> N[Upload results.tsv to GCS]
+    N --> O([✅ Done])
+
+    style A fill:#22c55e,color:#fff
+    style O fill:#22c55e,color:#fff
+    style G fill:#f59e0b,color:#000
+    style H fill:#3b82f6,color:#fff
+    style I fill:#ef4444,color:#fff
+    style F fill:#8b5cf6,color:#fff
 ```
-  ┌─────────────────────────────────────────────────┐
-  │              agent_config.py                    │  ← LLM planner edits this
-  │  SYSTEM_INSTRUCTION  ROUTING_RULES              │
-  │  STATIC_VARIABLES    CALLBACKS                  │
-  │  VARIABLES           TOOL_CACHE_CONFIG          │
-  └──────────────────┬──────────────────────────────┘
-                     │  propose → git commit
-  ┌──────────────────▼──────────────────────────────┐
-  │              evaluate.py  (READ-ONLY)           │
-  │  SimulationEvals  TurnEvals  ToolEvals          │
-  │  GuardrailEvals   CallbackEvals                 │
-  │  ─── all 5 run in parallel ───                  │
-  └──────────────────┬──────────────────────────────┘
-                     │
-  ┌──────────────────▼──────────────────────────────┐
-  │              eval_score (v2)                    │
-  │  keep → EMA-update baseline                     │
-  │  discard → git reset --soft                     │
-  │  converged → stop + HTML report + GCS upload    │
-  └─────────────────────────────────────────────────┘
+
+---
+
+## System Architecture
+
+```mermaid
+graph TB
+    subgraph Loop["🔄 auto_loop.py"]
+        AL[Autonomous Experiment Loop]
+        EMA[EMA Smoothing β=0.7]
+        CONV[Convergence Detector\ndeque maxlen=10]
+    end
+
+    subgraph Planning["🧠 Planners"]
+        MOP[MultiObjectivePlanner\nranks eval dimensions]
+        LP[LLMPlanner\nGemini / OpenAI / Anthropic]
+        DIV[Mutation Diversity\nmutation_history.json]
+    end
+
+    subgraph Config["⚙️ agent_config.py — AI edits this"]
+        SI[SYSTEM_INSTRUCTION]
+        RR[ROUTING_RULES]
+        SV[STATIC_VARIABLES]
+        TC[TOOL_CACHE_CONFIG]
+    end
+
+    subgraph Eval["📊 evaluate.py — READ-ONLY"]
+        SE[SimulationEvals × 0.35]
+        TE[TurnEvals × 0.20]
+        TOE[ToolEvals × 0.20]
+        LS[LatencyScore × 0.15]
+        GE[GuardrailEvals × 0.07]
+        CE[CallbackEvals × 0.03]
+        WS[WeightedScorer → eval_score]
+    end
+
+    subgraph Adapters["🔌 CXAS Adapters"]
+        CEA[CXASEvalsAdapter\ntenacity 3-retry]
+        CVA[CXASVersionsAdapter]
+        CVRA[CXASVariablesAdapter]
+    end
+
+    subgraph Output["📤 Output"]
+        TSV[results.tsv]
+        HTML[HTML Report]
+        GCS[GCS Bucket]
+        GIT[Git History]
+    end
+
+    AL --> MOP --> LP
+    LP --> DIV
+    LP --> Config
+    Config --> GIT
+    AL --> Eval
+    Eval --> CEA
+    CEA --> CXAS[(CXAS API\nces.googleapis.com)]
+    WS --> AL
+    AL --> EMA --> CONV
+    AL --> Adapters
+    AL --> Output
+
+    style Loop fill:#1e3a5f,color:#e2e8f0
+    style Planning fill:#3b1f5e,color:#e2e8f0
+    style Config fill:#1f4a2e,color:#e2e8f0
+    style Eval fill:#4a2e1f,color:#e2e8f0
+    style Adapters fill:#1f3a4a,color:#e2e8f0
+    style Output fill:#3d3d1f,color:#e2e8f0
 ```
 
 ---
@@ -45,12 +119,22 @@ automatically when the score window converges.
 ## Score formula (v2)
 
 ```
-eval_score = task_success      × 0.35   (SimulationEvals — goal completion)
-           + turn_pass_rate    × 0.20   (TurnEvals — per-turn quality)
-           + tool_pass_rate    × 0.20   (ToolEvals — tool call accuracy)
-           + latency_score     × 0.15   (1 − p95_ms/5000)
-           + guardrail_pass_rate × 0.07 (GuardrailEvals — safety blocking)
-           + callback_pass_rate  × 0.03 (CallbackEvals — webhook validation)
+eval_score = task_success        × 0.35   (SimulationEvals — goal completion)
+           + turn_pass_rate      × 0.20   (TurnEvals — per-turn quality)
+           + tool_pass_rate      × 0.20   (ToolEvals — tool call accuracy)
+           + latency_score       × 0.15   (1 − p95_ms/5000, capped 0–1)
+           + guardrail_pass_rate × 0.07   (GuardrailEvals — safety blocking)
+           + callback_pass_rate  × 0.03   (CallbackEvals — webhook validation)
+```
+
+```mermaid
+pie title eval_score Dimension Weights
+    "task_success — SimulationEvals" : 35
+    "turn_pass_rate — TurnEvals" : 20
+    "tool_pass_rate — ToolEvals" : 20
+    "latency_score" : 15
+    "guardrail_pass_rate — GuardrailEvals" : 7
+    "callback_pass_rate — CallbackEvals" : 3
 ```
 
 All six weights sum to **1.0** and are consistent across `evaluate.py`,
@@ -106,7 +190,10 @@ All settings are read from `.env` (see `.env.example`):
 | `AUTO_CXAS_GENERATE_HTML_REPORT` | `false` | Write HTML report at loop end |
 | `AUTO_CXAS_REPORT_DIR` | `.auto-cxas/reports` | HTML report output directory |
 | `AUTO_CXAS_GCS_RESULTS_BUCKET` | _(optional)_ | Upload `results.tsv` to this GCS bucket |
+| `AUTO_CXAS_DIVERSITY_WINDOW` | `5` | Last N mutations tracked for diversity enforcement |
 | `AUTO_CXAS_CALLBACK_SERVER_URL` | _(optional)_ | Webhook URL for live CallbackEvals |
+
+→ [Full configuration reference](docs/configuration.md)
 
 ---
 
@@ -158,6 +245,8 @@ Each test supports: `session_variables`, `persona`, `multi_turn_context`,
 | `CXASVersionsAdapter` | Manages CXAS Versions + Deployments via `ces.googleapis.com/v1alpha1` REST API |
 | `ScrapiAdapter` | Low-level `cxas-scrapi` client wrapper |
 
+→ [Adapter reference](docs/adapters.md)
+
 ---
 
 ## Production deployment
@@ -187,6 +276,8 @@ gcloud run jobs execute auto-cxas-scrapi --region=us-central1
 The Cloud Run Job runs up to 200 experiments, generates an HTML report, and
 uploads `results.tsv` to GCS on completion.
 
+→ [Full deployment guide](docs/deployment.md)
+
 ---
 
 ## Project structure
@@ -204,24 +295,21 @@ auto-cxas-scrapi/
 ├── cloudrun.yaml                   # Cloud Run Job definition
 ├── .github/workflows/ci.yml        # CI: lint, type-check, score regression
 ├── .env.example                    # All supported env vars
+├── docs/
+│   ├── index.md                    # Documentation overview
+│   ├── architecture.md             # Component deep-dive
+│   ├── configuration.md            # Full env-var reference
+│   ├── eval-types.md               # All 5 eval types explained
+│   ├── deployment.md               # Local, Docker, Cloud Run guides
+│   ├── adapters.md                 # Adapter API reference
+│   └── development.md              # Contributing & local dev
 └── src/auto_cxas_scrapi/
-    ├── adapters/
-    │   ├── cxas_callbacks.py       # 5 CXAS lifecycle hooks
-    │   ├── cxas_evals.py           # 5 eval types with tenacity retries
-    │   ├── cxas_variables.py       # Static + dynamic variable sync
-    │   ├── cxas_versions.py        # Versions + Deployments API
-    │   └── scrapi.py               # Low-level cxas-scrapi client
-    ├── planners/
-    │   ├── llm_planner.py          # LLM experiment planner
-    │   └── multi_objective_planner.py  # Eval dimension ranking
-    ├── reporting/
-    │   └── html_report.py          # Self-contained dark-theme HTML report
-    ├── scorers/
-    │   └── weighted.py             # 6-dimensional WeightedScorer
-    ├── config/
-    │   └── settings.py             # Pydantic settings (all env vars)
-    └── services/
-        └── orchestrator.py         # Wires all components together
+    ├── adapters/                   # CXAS API adapters
+    ├── planners/                   # LLM + multi-objective planners
+    ├── reporting/                  # HTML report generator
+    ├── scorers/                    # 6-dimensional WeightedScorer
+    ├── config/                     # Pydantic settings
+    └── services/                   # Orchestrator
 ```
 
 ---
@@ -243,6 +331,7 @@ auto-cxas-scrapi/
 - Failed experiments use `git reset --soft HEAD~1` + `git checkout -- agent_config.py` (never `--hard`)
 - EMA smoothing (`--ema`) prevents a noisy eval from permanently lowering the baseline
 - Convergence detection stops the loop automatically to prevent wasteful over-iteration
+- Mutation diversity enforcement prevents the LLM from repeating the same change type
 
 ---
 
