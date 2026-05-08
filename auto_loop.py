@@ -34,12 +34,15 @@ from auto_cxas_scrapi.services.orchestrator import AutoCXASOrchestrator
 
 console = Console()
 RESULTS_TSV = Path("results.tsv")
-TSV_HEADER = "commit\teval_score\ttask_success\tlatency_ms_p95\ttool_error_rate\tstatus\tdescription\ttimestamp\n"
+TSV_HEADER = (
+    "commit\teval_score\ttask_success\tlatency_ms_p95\t"
+    "tool_error_rate\tstatus\tdescription\ttimestamp\n"
+)
 EMA_BETA: float = 0.7
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# TSV helpers
 # ---------------------------------------------------------------------------
 
 def _ensure_results_tsv() -> None:
@@ -66,6 +69,10 @@ def _append_tsv(
         fh.write(row)
 
 
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
 def _get_repo() -> _git.Repo:
     return _git.Repo(search_parent_directories=True)
 
@@ -86,9 +93,6 @@ def _git_commit_agent_config(description: str) -> bool:
             return False
         repo.index.commit(f"exp: {description}")
         return True
-    except _git.GitCommandError as exc:
-        console.print(f"[yellow]git commit failed: {exc}[/yellow]")
-        return False
     except Exception as exc:
         console.print(f"[yellow]git commit failed: {exc}[/yellow]")
         return False
@@ -104,6 +108,10 @@ def _git_reset_last_commit() -> None:
         console.print(f"[red]git reset failed: {exc}[/red]")
 
 
+# ---------------------------------------------------------------------------
+# Evaluate helper
+# ---------------------------------------------------------------------------
+
 def _run_evaluate(dry_run: bool) -> dict:
     """Run evaluate.py in a subprocess and return parsed metrics."""
     cmd = [sys.executable, "evaluate.py", "--output-json"]
@@ -114,14 +122,20 @@ def _run_evaluate(dry_run: bool) -> dict:
         result_path = Path(".auto-cxas/state") / "last_result.json"
         if result_path.exists():
             return json.loads(result_path.read_text("utf-8"))
-        return {"eval_score": 0.0, "task_success": 0.0,
-                "latency_ms_p95": 9999, "tool_error_rate": 1.0,
-                "error": "last_result.json not written"}
+        return {
+            "eval_score": 0.0, "task_success": 0.0,
+            "latency_ms_p95": 9999, "tool_error_rate": 1.0,
+            "error": "last_result.json not written",
+        }
     except subprocess.TimeoutExpired:
         return {"eval_score": 0.0, "error": "evaluate.py timed out"}
     except Exception as exc:
         return {"eval_score": 0.0, "error": str(exc)}
 
+
+# ---------------------------------------------------------------------------
+# Convergence detection
+# ---------------------------------------------------------------------------
 
 def _is_converged(window: deque, threshold: float) -> bool:
     """Return True when window is full and score range is below threshold."""
@@ -130,8 +144,34 @@ def _is_converged(window: deque, threshold: float) -> bool:
     return (max(window) - min(window)) < threshold
 
 
+# ---------------------------------------------------------------------------
+# Mutation diversity tracking
+# ---------------------------------------------------------------------------
+
+def _record_mutation(mutation: dict, state_dir: Path, diversity_window: int) -> None:
+    """Append mutation type to mutation_history.json, keeping last N entries."""
+    history_path = state_dir / "mutation_history.json"
+    history: list[dict] = []
+    if history_path.exists():
+        try:
+            history = json.loads(history_path.read_text("utf-8"))
+        except Exception:
+            pass
+    history.append({
+        "type": mutation.get("type", "unknown"),
+        "path": mutation.get("path", ""),
+        "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    history = history[-diversity_window:]
+    state_dir.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Post-loop output helpers
+# ---------------------------------------------------------------------------
+
 def _maybe_generate_report(settings) -> None:
-    """Generate HTML report if enabled in settings."""
     if not settings.generate_html_report:
         return
     try:
@@ -143,7 +183,6 @@ def _maybe_generate_report(settings) -> None:
 
 
 def _maybe_export_gcs(settings) -> None:
-    """Upload results.tsv to GCS bucket if configured."""
     bucket = getattr(settings, "gcs_results_bucket", "")
     if not bucket or not RESULTS_TSV.exists():
         return
@@ -176,6 +215,7 @@ def run_loop(
     configure_logging(settings.log_level)
     orch = AutoCXASOrchestrator(settings)
     _ensure_results_tsv()
+    state_dir = Path(settings.state_dir)
 
     console.print(Rule("[bold cyan]auto-cxas-scrapi autonomous loop[/bold cyan]"))
     console.print(f"  project     : {settings.google_cloud_project or '[yellow]NOT SET[/yellow]'}")
@@ -187,6 +227,9 @@ def run_loop(
     console.print(
         f"  convergence : window={settings.convergence_window}  "
         f"threshold={settings.convergence_threshold}"
+    )
+    console.print(
+        f"  diversity   : window={settings.diversity_window} mutation types tracked"
     )
     console.print(Rule())
 
@@ -228,10 +271,11 @@ def run_loop(
             continue
 
         candidate = candidates[0]
+        mut_type = candidate.mutation.get("type", "unknown") if candidate.mutation else "unknown"
         console.print(f"[cyan]Candidate:[/cyan] {candidate.experiment_id}")
         console.print(f"  Title     : {candidate.title}")
         console.print(f"  Hypothesis: {candidate.hypothesis}")
-        console.print(f"  Mutation  : {candidate.mutation}")
+        console.print(f"  Mutation  : {candidate.mutation}  ({mut_type})")
 
         if candidate.new_agent_config_content:
             Path("agent_config.py").write_text(
@@ -285,6 +329,10 @@ def run_loop(
             status = "discard"
             n_discard += 1
             console.print("[red]DISCARD — no improvement. Reverted.[/red]")
+
+        # Record mutation type for diversity tracking
+        if candidate.mutation:
+            _record_mutation(candidate.mutation, state_dir, settings.diversity_window)
 
         score_window.append(candidate_score)
 

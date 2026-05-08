@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     # Convergence detection
     convergence_window: int = Field(default=10, alias="AUTO_CXAS_CONVERGENCE_WINDOW")
     convergence_threshold: float = Field(default=0.002, alias="AUTO_CXAS_CONVERGENCE_THRESHOLD")
+    # Mutation diversity enforcement
+    diversity_window: int = Field(default=5, alias="AUTO_CXAS_DIVERSITY_WINDOW")
     # Callback server
     callback_server_url: str = Field(default="", alias="AUTO_CXAS_CALLBACK_SERVER_URL")
     callback_secret: str = Field(default="", alias="AUTO_CXAS_CALLBACK_SECRET")
