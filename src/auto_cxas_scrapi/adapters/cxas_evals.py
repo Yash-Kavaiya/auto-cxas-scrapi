@@ -1,20 +1,13 @@
-"""cxas-scrapi eval adapter — wraps all 5 eval types.
-
-Eval classes (from cxas_scrapi.__init__):
-  SimulationEvals(app_name)  — multi-turn goal-based LLM simulation
-  ToolEvals(app_name)        — direct tool call evaluation
-  GuardrailEvals(app_name)   — safety/guardrail policy evaluation
-  TurnEvals(app_name)        — single-turn agent response evaluation
-  CallbackEvals(app_name)    — webhook/callback evaluation
-"""
+"""cxas-scrapi eval adapter — wraps all 5 eval types with tenacity retry logic."""
 from __future__ import annotations
 
 import logging
 from typing import Any
 
+from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log
+
 log = logging.getLogger(__name__)
 
-# Module-level imports so tests can patch these names with unittest.mock.patch().
 try:
     from cxas_scrapi import (  # type: ignore[import-untyped]
         CallbackEvals,
@@ -25,6 +18,19 @@ try:
     )
 except ImportError:
     SimulationEvals = ToolEvals = GuardrailEvals = TurnEvals = CallbackEvals = None  # type: ignore[assignment]
+
+
+def _retry_call(fn, *args, **kwargs) -> Any:  # type: ignore[no-untyped-def]
+    """Call fn(*args, **kwargs) with 3-attempt exponential backoff (2s/4s/8s max 30s)."""
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+        before_sleep=before_sleep_log(log, logging.WARNING),
+    )
+    def _inner() -> Any:
+        return fn(*args, **kwargs)
+    return _inner()
 
 
 class CXASEvalsAdapter:
@@ -53,7 +59,8 @@ class CXASEvalsAdapter:
             return self._unavailable_result("SimulationEvals")
         try:
             client = SimulationEvals(app_name=self.full_app_name)
-            results = client.run_simulations(
+            results = _retry_call(
+                client.run_simulations,
                 test_cases=test_cases,
                 runs=runs,
                 parallel=parallel,
@@ -97,7 +104,12 @@ class CXASEvalsAdapter:
             return self._unavailable_result("ToolEvals")
         try:
             client = ToolEvals(app_name=self.full_app_name)
-            results = client.run_evals(eval_dataset=eval_dataset, parallel=parallel, verbose=verbose)
+            results = _retry_call(
+                client.run_evals,
+                eval_dataset=eval_dataset,
+                parallel=parallel,
+                verbose=verbose,
+            )
             return self._aggregate_generic(results, "tool")
         except Exception as exc:
             log.warning("ToolEvals failed: %s", exc)
@@ -118,7 +130,12 @@ class CXASEvalsAdapter:
             return self._unavailable_result("GuardrailEvals")
         try:
             client = GuardrailEvals(app_name=self.full_app_name)
-            results = client.run_evals(eval_dataset=eval_dataset, parallel=parallel, verbose=verbose)
+            results = _retry_call(
+                client.run_evals,
+                eval_dataset=eval_dataset,
+                parallel=parallel,
+                verbose=verbose,
+            )
             return self._aggregate_generic(results, "guardrail")
         except Exception as exc:
             log.warning("GuardrailEvals failed: %s", exc)
@@ -140,8 +157,12 @@ class CXASEvalsAdapter:
             return self._unavailable_result("TurnEvals")
         try:
             client = TurnEvals(app_name=self.full_app_name)
-            results = client.run_evals(
-                eval_dataset=eval_dataset, parallel=parallel, model=model, verbose=verbose
+            results = _retry_call(
+                client.run_evals,
+                eval_dataset=eval_dataset,
+                parallel=parallel,
+                model=model,
+                verbose=verbose,
             )
             return self._aggregate_generic(results, "turn")
         except Exception as exc:
@@ -163,7 +184,12 @@ class CXASEvalsAdapter:
             return self._unavailable_result("CallbackEvals")
         try:
             client = CallbackEvals(app_name=self.full_app_name)
-            results = client.run_evals(eval_dataset=eval_dataset, parallel=parallel, verbose=verbose)
+            results = _retry_call(
+                client.run_evals,
+                eval_dataset=eval_dataset,
+                parallel=parallel,
+                verbose=verbose,
+            )
             return self._aggregate_generic(results, "callback")
         except Exception as exc:
             log.warning("CallbackEvals failed: %s", exc)

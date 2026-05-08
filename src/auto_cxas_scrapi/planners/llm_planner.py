@@ -18,17 +18,38 @@ You are an expert Google Cloud CX Agent Studio optimization researcher.
 Given the current agent_config.py and results history, propose ONE targeted
 experiment to improve the weakest eval dimension indicated below.
 
-eval_score = task_success * 0.60 + latency_score * 0.25 + reliability * 0.15
+Score formula (weights sum to 1.0):
+  eval_score = task_success * 0.35
+             + turn_pass_rate * 0.20
+             + tool_pass_rate * 0.20
+             + latency_score  * 0.15   (latency_score = max(0, 1 - p95_ms/5000))
+             + guardrail_pass_rate * 0.07
+             + callback_pass_rate  * 0.03
 
-You MUST output ONLY valid JSON with this exact schema — no markdown fences, \
-no extra text:
+Mutable variables in agent_config.py and their primary impact:
+  SYSTEM_INSTRUCTION              → task_success, turn_pass_rate
+  STATIC_VARIABLES ({{var}})      → task_success (inject large policy blocks)
+  ROUTING_RULES thresholds        → task_success, tool_pass_rate
+  ROUTING_RULES priorities        → task_success
+  TOOL_DESCRIPTIONS               → tool_pass_rate
+  GUARDRAIL_PARAMS                → guardrail_pass_rate
+  RESPONSE_TEMPLATES              → task_success, turn_pass_rate
+  FALLBACK_POLICY                 → task_success
+  CALLBACKS.before_model.deterministic_intents  → latency_score (LLM bypass)
+  CALLBACKS.before_tool.cacheable_tools         → latency_score (tool cache)
+  TOOL_CACHE_CONFIG[tool].ttl_seconds           → latency_score
+  CALLBACK_CONFIG[tool].timeout_ms              → callback_pass_rate
+  CALLBACK_CONFIG[tool].retries                 → callback_pass_rate
+  VARIABLES (session state scoping)             → task_success
+
+You MUST output ONLY valid JSON with this exact schema — no markdown fences, no extra text:
 {
   "title": "Short experiment title",
   "hypothesis": "What you expect to happen and why",
   "target_eval": "simulation|tool|turn|guardrail|callback",
   "target_metric": "the metric key being improved",
   "mutation": {
-    "type": "prompt_patch|config_update|threshold_tune|template_change",
+    "type": "prompt_patch|config_update|threshold_tune|template_change|callback_tune|cache_tune|variable_tune",
     "path": "VARIABLE.key",
     "operation": "replace|append|prepend|adjust",
     "value": "<new value or delta>",
@@ -56,10 +77,6 @@ class LLMOptimizationPlanner(Planner):
         self.repo_root = repo_root or Path.cwd()
         self.state_dir = state_dir or self.repo_root / ".auto-cxas" / "state"
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def propose(self, *, context: dict) -> list[ExperimentCandidate]:
         target_eval, target_metric, current_score = self._find_weakest_eval()
 
@@ -82,7 +99,7 @@ class LLMOptimizationPlanner(Planner):
             response = self.llm.complete(
                 system=_SYSTEM_PROMPT,
                 user=user_prompt,
-                max_tokens=2048,
+                max_tokens=3000,
             )
             raw = response.content.strip()
             if "```json" in raw:
@@ -105,10 +122,6 @@ class LLMOptimizationPlanner(Planner):
             log.warning("LLM proposal failed: %s — using fallback", exc)
             return self._fallback_propose(context, target_eval)
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
     def _find_weakest_eval(self) -> tuple[str, str, float]:
         ranked = rank_eval_types(load_last_metrics(self.state_dir))
         if ranked:
@@ -129,7 +142,6 @@ class LLMOptimizationPlanner(Planner):
         return "\n".join([header] + recent)
 
     def _patch_agent_config(self, content: str, mutation: dict) -> str:
-        """Apply a simple string patch when LLM omits new_agent_config_content."""
         op = mutation.get("operation", "")
         path = mutation.get("path", "")
         value = mutation.get("value", "")
@@ -163,5 +175,4 @@ class LLMOptimizationPlanner(Planner):
         )]
 
 
-# Keep old name as alias for backwards compatibility with any existing imports.
 LLMExperimentPlanner = LLMOptimizationPlanner
