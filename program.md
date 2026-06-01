@@ -84,6 +84,47 @@ the *weakest* of these five dimensions each iteration:
 In `--dry-run` mode all five proxy from `task_success`. In live mode, extend
 `evaluate.py`'s `main()` to call the other four eval types for full coverage.
 
+## The Feedback Arrow — failures become new test cases
+
+The eval loop only compounds if failures feed back into the benchmark. Without
+this, the loop optimizes against a static set and plateaus once it saturates.
+This is implemented by the `auto_cxas_scrapi.feedback` package and runs
+automatically inside `auto_loop.py` every `AUTO_CXAS_FEEDBACK_INGEST_EVERY`
+experiments (default 10).
+
+Each feedback cycle:
+
+1. **Harvest production failures** — `FeedbackIngestor` pulls recent CX Agent
+   Studio conversations via `ScrapiAdapter.list_recent_conversations()` and keeps
+   only failures (thumbs-down, rating `< 3`, escalation, or no-match).
+2. **Stage as candidates** — new failing utterances are written to
+   `golden_candidates.yaml` (same schema as `golden_tests.yaml` plus tracking
+   counters), de-duped against both the candidate pool and the golden set.
+3. **Re-grade candidates** — `BenchmarkManager.record_run()` grades every staged
+   candidate against the *current* agent using the exact same grading logic as
+   the official eval (`evaluate.grade_tests`), without polluting the official
+   score. Reproductions increment `seen_failures`.
+4. **Auto-promote** — once a candidate has reproduced as a failure
+   `AUTO_CXAS_CANDIDATE_PROMOTE_THRESHOLD` times (default 2), it is moved into
+   `golden_tests.yaml` and the benchmark grows.
+
+Separately, `evaluate.py` now persists per-test failures (`failed_tests` in
+`last_result.json`). The `LLMOptimizationPlanner` reads these and injects the
+concrete failing utterances into its prompt — the "fix what failed" signal —
+so mutations target real failures instead of guessing.
+
+**Settings** (in `.env`):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `AUTO_CXAS_FEEDBACK_INGEST_EVERY` | 10 | Run a feedback cycle every N experiments (0 disables). |
+| `AUTO_CXAS_CANDIDATE_PROMOTE_THRESHOLD` | 2 | Reproductions required before promotion. |
+| `AUTO_CXAS_FEEDBACK_LOOKBACK_HOURS` | 24 | Conversation-history lookback window. |
+| `AUTO_CXAS_FEEDBACK_MAX_CONVERSATIONS` | 200 | Cap on conversations fetched per cycle. |
+
+> `golden_candidates.yaml` is generated and safe to delete; `golden_tests.yaml`
+> is the official benchmark — promoted cases are appended to it automatically.
+
 ## Results TSV Format
 
 ```

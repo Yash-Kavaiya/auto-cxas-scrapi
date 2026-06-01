@@ -41,7 +41,7 @@ def test_run_dry_returns_five_tuple() -> None:
         mod.GoldenTest("t2", "bye", "escalation"),
         mod.GoldenTest("t3", "unknown", "missing_intent"),
     ]
-    total, passed, latencies, ter, metrics = mod._run_dry(tests, cfg)
+    total, passed, latencies, ter, metrics, failed_tests = mod._run_dry(tests, cfg)
     assert total == 3
     assert passed == 2
     assert len(latencies) == 3
@@ -49,6 +49,9 @@ def test_run_dry_returns_five_tuple() -> None:
     assert set(metrics) == {"task_success", "tool_pass_rate", "turn_pass_rate",
                             "guardrail_pass_rate", "callback_pass_rate"}
     assert metrics["task_success"] == pytest.approx(2 / 3)
+    # The one unrouted intent is captured as a concrete failure.
+    assert [f["test_id"] for f in failed_tests] == ["t3"]
+    assert failed_tests[0]["failed_dimensions"] == ["intent_not_routed"]
 
 
 def test_golden_to_tool_case_no_tool() -> None:
@@ -121,7 +124,7 @@ def test_run_live_calls_all_five_adapters(tmp_path, monkeypatch) -> None:
         },
         "SYSTEM_INSTRUCTION": "x" * 60,
     }
-    total, passed, latencies, ter, metrics = mod._run_live(tests, cfg)
+    total, passed, latencies, ter, metrics, _failed = mod._run_live(tests, cfg)
 
     assert total == 5
     assert passed == 4

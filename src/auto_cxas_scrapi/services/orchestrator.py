@@ -37,7 +37,6 @@ class AutoCXASOrchestrator:
         self.scorer = WeightedScorer()
         self.policy = PromotionPolicy(
             min_score_delta=settings.min_score_delta,
-            require_manual_approval=(settings.approval_mode == "manual"),
         )
         if settings.google_cloud_project and settings.app_name:
             self.runner = LiveExperimentRunner(

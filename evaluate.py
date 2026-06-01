@@ -44,6 +44,9 @@ class EvalResult:
     error: str = ""
     # Per-eval-type pass rates read by LLMOptimizationPlanner to pick the weakest dimension.
     metrics: dict = field(default_factory=dict)
+    # Concrete per-test failures — the "fix what failed" signal for the planner
+    # and the raw material harvested into the growing benchmark (golden_candidates.yaml).
+    failed_tests: list = field(default_factory=list)
 
     def print_summary(self) -> None:
         print("---")
@@ -200,7 +203,39 @@ def _golden_to_callback_case(test: GoldenTest, routing: dict) -> dict[str, Any] 
 # Runners
 # ---------------------------------------------------------------------------
 
-_EvalTuple = tuple[int, int, list[float], float, dict[str, float]]
+# (total, passed, latencies, tool_error_rate, per-eval-type pass rates, failed tests)
+_EvalTuple = tuple[int, int, list[float], float, dict[str, float], list[dict[str, Any]]]
+
+
+def _failure_record(test: GoldenTest, dimensions: list[str]) -> dict[str, Any]:
+    """Serialize a failed GoldenTest into the failed_tests payload.
+
+    Shape mirrors the golden_tests.yaml schema so the harvester can turn it
+    directly into a candidate test case, plus the dimensions that failed.
+    """
+    return {
+        "test_id": test.test_id,
+        "user_utterance": test.user_utterance,
+        "expected_intent": test.expected_intent,
+        "expected_response_contains": list(test.expected_response_contains),
+        "max_latency_ms": test.max_latency_ms,
+        "failed_dimensions": dimensions,
+    }
+
+
+def _failed_names(res: dict[str, Any]) -> set[str]:
+    """Extract the set of test names that did NOT pass from an eval result's raw rows."""
+    failed: set[str] = set()
+    for row in res.get("raw", []) or []:
+        name = row.get("name") or row.get("test_id") or row.get("case")
+        if not name:
+            continue
+        passed = row.get("passed", None)
+        if passed is None:
+            passed = row.get("result", "") == "PASS"
+        if not passed:
+            failed.add(str(name))
+    return failed
 
 
 def _run_dry(tests: list[GoldenTest], cfg: dict[str, Any]) -> _EvalTuple:
@@ -208,12 +243,19 @@ def _run_dry(tests: list[GoldenTest], cfg: dict[str, Any]) -> _EvalTuple:
     instruction: str = cfg.get("SYSTEM_INSTRUCTION", "")
     latencies: list[float] = []
     passed = 0
+    failed_tests: list[dict[str, Any]] = []
     for test in tests:
         t = time.perf_counter()
         ok = (test.expected_intent in routing) and len(instruction) > MIN_INSTRUCTION_LENGTH
         latencies.append((time.perf_counter() - t) * 1000 + 700)
         if ok:
             passed += 1
+        else:
+            reason = (
+                "intent_not_routed" if test.expected_intent not in routing
+                else "system_instruction_too_short"
+            )
+            failed_tests.append(_failure_record(test, [reason]))
     ts = passed / len(tests) if tests else 0.0
     return len(tests), passed, latencies, 0.0, {
         "task_success": ts,
@@ -221,13 +263,20 @@ def _run_dry(tests: list[GoldenTest], cfg: dict[str, Any]) -> _EvalTuple:
         "turn_pass_rate": ts,
         "guardrail_pass_rate": ts,
         "callback_pass_rate": ts,
-    }
+    }, failed_tests
 
 
 def _run_live(tests: list[GoldenTest], cfg: dict[str, Any]) -> _EvalTuple:
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    app_name = os.environ.get("AUTO_CXAS_APP_NAME", "")
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+    try:
+        from auto_cxas_scrapi.config.settings import get_settings
+        settings = get_settings()
+        project_id = settings.google_cloud_project
+        app_name = settings.app_name
+        location = settings.google_cloud_location
+    except Exception:
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+        app_name = os.environ.get("AUTO_CXAS_APP_NAME", "")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
     if not project_id or not app_name:
         print("[WARN] Missing GOOGLE_CLOUD_PROJECT or AUTO_CXAS_APP_NAME -- dry-run fallback")
@@ -289,8 +338,43 @@ def _run_live(tests: list[GoldenTest], cfg: dict[str, Any]) -> _EvalTuple:
         "guardrail_pass_rate": guardrail_pr,
         "callback_pass_rate": callback_pr,
     }
+
+    # Per-test failures across every dimension — the "fix what failed" signal.
+    failures_by_dim = {
+        "simulation": _failed_names(sim),
+        "tool": _failed_names(tool_res),
+        "turn": _failed_names(turn_res),
+        "guardrail": _failed_names(guardrail_res),
+        "callback": _failed_names(callback_res),
+    }
+    failed_tests: list[dict[str, Any]] = []
+    for test in tests:
+        dims = [d for d, names in failures_by_dim.items() if test.test_id in names]
+        if dims:
+            failed_tests.append(_failure_record(test, dims))
+
     ter = 1.0 - tool_pr
-    return sim.get("total", len(tests)), sim.get("passed", 0), latencies, ter, metrics
+    return sim.get("total", len(tests)), sim.get("passed", 0), latencies, ter, metrics, failed_tests
+
+
+# ---------------------------------------------------------------------------
+# Public grading helper — reused by the benchmark harvester to check whether a
+# staged candidate still reproduces as a failure, WITHOUT polluting the official
+# golden_tests.yaml score.
+# ---------------------------------------------------------------------------
+
+def grade_tests(tests: list[GoldenTest], *, dry_run: bool = False) -> list[dict[str, Any]]:
+    """Grade an arbitrary list of GoldenTests and return only the failures.
+
+    Uses the exact same runner the official eval uses, so a candidate that
+    fails here is failing for the same reasons it would in the real benchmark.
+    """
+    if not tests:
+        return []
+    cfg = _load_agent_config()
+    runner = _run_dry if dry_run else _run_live
+    *_, failed_tests = runner(tests, cfg)
+    return failed_tests
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +393,7 @@ def main(dry_run: bool = False, output_json: bool = False) -> EvalResult:
         return result
 
     tests = _load_golden_tests()
-    total, passed, latencies, ter, eval_metrics = (
+    total, passed, latencies, ter, eval_metrics, failed_tests = (
         _run_dry(tests, cfg) if dry_run else _run_live(tests, cfg)
     )
 
@@ -322,6 +406,7 @@ def main(dry_run: bool = False, output_json: bool = False) -> EvalResult:
     result.eval_seconds = time.perf_counter() - t0
     result.eval_score = _compute_eval_score(result.task_success, result.latency_ms_p95, ter)
     result.metrics = eval_metrics
+    result.failed_tests = failed_tests
 
     result.print_summary()
 

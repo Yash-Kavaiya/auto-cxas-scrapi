@@ -34,6 +34,20 @@ class Settings(BaseSettings):
     baseline_cache_ttl_seconds: int = Field(
         default=300, alias="AUTO_CXAS_BASELINE_CACHE_TTL_SECONDS"
     )
+    # --- Feedback loop (failures → new benchmark test cases) ---
+    # Pull production conversations into the candidate pool every N experiments
+    # (0 disables production ingestion; eval-failure harvesting still runs).
+    feedback_ingest_every: int = Field(default=10, alias="AUTO_CXAS_FEEDBACK_INGEST_EVERY")
+    # How many times a candidate must reproduce as a failure before auto-promotion.
+    candidate_promote_threshold: int = Field(
+        default=2, alias="AUTO_CXAS_CANDIDATE_PROMOTE_THRESHOLD"
+    )
+    # Lookback window when fetching CX Agent Studio conversation history.
+    feedback_lookback_hours: int = Field(default=24, alias="AUTO_CXAS_FEEDBACK_LOOKBACK_HOURS")
+    # Cap on conversations fetched per ingest cycle.
+    feedback_max_conversations: int = Field(
+        default=200, alias="AUTO_CXAS_FEEDBACK_MAX_CONVERSATIONS"
+    )
 
     def ensure_directories(self) -> None:
         self.runs_dir.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import json; d=json.load\\(open\\('.auto-cxas/state/last_result.json',encoding='utf-8'\\)\\); print\\('failed_tests present:', 'failed_tests' in d, '| count:', len\\(d['failed_tests']\\)\\)\")"
+    ]
+  }
+}

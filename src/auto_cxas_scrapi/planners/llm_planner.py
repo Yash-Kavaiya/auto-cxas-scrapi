@@ -68,10 +68,12 @@ class LLMOptimizationPlanner(Planner):
 
         agent_config = self._read_agent_config()
         results_history = self._read_results_history()
+        failing_cases = self._read_failing_cases()
 
         user_prompt = (
             f"WEAKEST EVAL: {target_eval} ({target_metric} = {current_score:.3f})\n"
             f"Target this eval dimension in your proposed mutation.\n\n"
+            f"{failing_cases}"
             f"Current agent_config.py:\n```python\n{agent_config}\n```\n\n"
             f"Recent results (results.tsv):\n```\n{results_history}\n```\n\n"
             f"App context: {json.dumps(context, indent=2)}\n\n"
@@ -127,6 +129,34 @@ class LLMOptimizationPlanner(Planner):
         header = lines[0] if lines else ""
         recent = lines[-max_rows:] if len(lines) > 1 else []
         return "\n".join([header] + recent)
+
+    def _read_failing_cases(self, max_cases: int = 5) -> str:
+        """Surface concrete failing test cases ("fix what failed") to the planner.
+
+        Reads the per-test failures persisted by evaluate.py into last_result.json
+        and renders the top few as a focused block. Returns "" when none exist.
+        """
+        p = self.state_dir / "last_result.json"
+        if not p.exists():
+            return ""
+        try:
+            data = json.loads(p.read_text("utf-8"))
+        except Exception:
+            return ""
+        failures = data.get("failed_tests") or []
+        if not failures:
+            return ""
+        lines = ["CONCRETE FAILING CASES (fix these specifically):"]
+        for f in failures[:max_cases]:
+            dims = ", ".join(f.get("failed_dimensions", [])) or "unknown"
+            expects = ", ".join(f.get("expected_response_contains", []))
+            lines.append(
+                f'  - "{f.get("user_utterance", "")}" '
+                f'(intent={f.get("expected_intent", "?")}, failed: {dims}'
+                + (f"; expected response to mention: {expects}" if expects else "")
+                + ")"
+            )
+        return "\n".join(lines) + "\n\n"
 
     def _patch_agent_config(self, content: str, mutation: dict) -> str:
         """Apply a simple string patch when LLM omits new_agent_config_content."""

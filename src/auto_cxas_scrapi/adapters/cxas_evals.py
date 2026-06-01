@@ -88,7 +88,7 @@ class CXASEvalsAdapter:
 
     def run_tool_evals(
         self,
-        eval_dataset: list[dict],
+        test_cases: list[dict],
         *,
         parallel: int = 1,
         verbose: bool = False,
@@ -97,7 +97,7 @@ class CXASEvalsAdapter:
             return self._unavailable_result("ToolEvals")
         try:
             client = ToolEvals(app_name=self.full_app_name)
-            results = client.run_evals(eval_dataset=eval_dataset, parallel=parallel, verbose=verbose)
+            results = client.run_evals(eval_dataset=test_cases, parallel=parallel, verbose=verbose)
             return self._aggregate_generic(results, "tool")
         except Exception as exc:
             log.warning("ToolEvals failed: %s", exc)
@@ -109,7 +109,7 @@ class CXASEvalsAdapter:
 
     def run_guardrail_evals(
         self,
-        eval_dataset: list[dict],
+        test_cases: list[dict],
         *,
         parallel: int = 1,
         verbose: bool = False,
@@ -118,7 +118,7 @@ class CXASEvalsAdapter:
             return self._unavailable_result("GuardrailEvals")
         try:
             client = GuardrailEvals(app_name=self.full_app_name)
-            results = client.run_evals(eval_dataset=eval_dataset, parallel=parallel, verbose=verbose)
+            results = client.run_evals(eval_dataset=test_cases, parallel=parallel, verbose=verbose)
             return self._aggregate_generic(results, "guardrail")
         except Exception as exc:
             log.warning("GuardrailEvals failed: %s", exc)
@@ -130,7 +130,7 @@ class CXASEvalsAdapter:
 
     def run_turn_evals(
         self,
-        eval_dataset: list[dict],
+        test_cases: list[dict],
         *,
         parallel: int = 1,
         model: str = "gemini-2.0-flash",
@@ -141,7 +141,7 @@ class CXASEvalsAdapter:
         try:
             client = TurnEvals(app_name=self.full_app_name)
             results = client.run_evals(
-                eval_dataset=eval_dataset, parallel=parallel, model=model, verbose=verbose
+                eval_dataset=test_cases, parallel=parallel, model=model, verbose=verbose
             )
             return self._aggregate_generic(results, "turn")
         except Exception as exc:
@@ -154,7 +154,7 @@ class CXASEvalsAdapter:
 
     def run_callback_evals(
         self,
-        eval_dataset: list[dict],
+        test_cases: list[dict],
         *,
         parallel: int = 1,
         verbose: bool = False,
@@ -163,7 +163,7 @@ class CXASEvalsAdapter:
             return self._unavailable_result("CallbackEvals")
         try:
             client = CallbackEvals(app_name=self.full_app_name)
-            results = client.run_evals(eval_dataset=eval_dataset, parallel=parallel, verbose=verbose)
+            results = client.run_evals(eval_dataset=test_cases, parallel=parallel, verbose=verbose)
             return self._aggregate_generic(results, "callback")
         except Exception as exc:
             log.warning("CallbackEvals failed: %s", exc)
@@ -181,12 +181,17 @@ class CXASEvalsAdapter:
             1 for r in results
             if r.get("passed", False) or r.get("result", "") == "PASS"
         )
+        durations_ms = sorted(
+            r.get("duration_s", 0) * 1000 for r in results if "duration_s" in r
+        )
+        p95_idx = max(0, int(len(durations_ms) * 0.95) - 1)
         return {
             "available": True,
             "eval_type": eval_type,
             "total": len(results),
             "passed": passed,
             "pass_rate": round(passed / len(results), 4),
+            "latency_ms_p95": int(durations_ms[p95_idx]) if durations_ms else 0,
             "raw": results,
         }
 

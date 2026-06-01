@@ -11,15 +11,21 @@ class PolicyDecision:
 
 
 class PromotionPolicy:
+    """
+    Promotion safety policy gate.
+
+    Evaluates objective quality criteria (score delta, latency, error rate).
+    Manual approval is NOT part of the policy evaluation — it is handled by
+    the CLI/loop layer via settings.approval_mode.
+    """
+
     def __init__(
         self, *,
         min_score_delta: float = 0.01,
-        require_manual_approval: bool = True,
         max_latency_regression_ms: int = 500,
         max_error_rate_increase: float = 0.05,
     ) -> None:
         self.min_score_delta = min_score_delta
-        self.require_manual_approval = require_manual_approval
         self.max_latency_regression_ms = max_latency_regression_ms
         self.max_error_rate_increase = max_error_rate_increase
 
@@ -32,6 +38,12 @@ class PromotionPolicy:
         baseline_error_rate: float = 0.0,
         candidate_error_rate: float = 0.0,
     ) -> PolicyDecision:
+        """
+        Evaluate objective quality criteria.
+
+        Returns allowed=True only when ALL checks pass (score improved
+        within acceptable latency and error-rate bounds).
+        """
         reasons: list[str] = []
         delta = candidate_score - baseline_score
         if delta < self.min_score_delta:
@@ -48,6 +60,4 @@ class PromotionPolicy:
             reasons.append(
                 f"Error rate increase +{error_delta:.4f} exceeds limit {self.max_error_rate_increase:.4f}."
             )
-        if self.require_manual_approval:
-            reasons.append("Manual approval required -- run `auto-cxas promote --experiment <id>`.")
         return PolicyDecision(allowed=len(reasons) == 0, reasons=reasons)

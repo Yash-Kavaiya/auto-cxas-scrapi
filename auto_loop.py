@@ -19,6 +19,7 @@ See program.md for the full strategy guide.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -30,12 +31,16 @@ from rich.console import Console
 from rich.rule import Rule
 
 from auto_cxas_scrapi.config.settings import get_settings
+from auto_cxas_scrapi.feedback import BenchmarkManager, FeedbackIngestor
 from auto_cxas_scrapi.observability.logging import configure_logging
 from auto_cxas_scrapi.services.orchestrator import AutoCXASOrchestrator
 
 console = Console()
 RESULTS_TSV = Path("results.tsv")
 TSV_HEADER = "commit\teval_score\ttask_success\tlatency_ms_p95\ttool_error_rate\tstatus\tdescription\ttimestamp\n"
+TRIED_MUTATIONS_FILE = Path(".auto-cxas/state/tried_mutations.json")
+GOLDEN_TESTS_FILE = Path("golden_tests.yaml")
+GOLDEN_CANDIDATES_FILE = Path("golden_candidates.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +110,45 @@ def _git_reset_last_commit() -> None:
         console.print(f"[red]git reset failed: {exc.stderr.decode().strip()}[/red]")
 
 
+def _load_tried_mutations() -> set[str]:
+    """Load set of mutation signatures that have already been attempted."""
+    if not TRIED_MUTATIONS_FILE.exists():
+        return set()
+    try:
+        data = json.loads(TRIED_MUTATIONS_FILE.read_text("utf-8"))
+        return set(data.get("signatures", []))
+    except Exception:
+        return set()
+
+
+def _save_tried_mutation(signature: str) -> None:
+    """Persist a mutation signature so we never re-try it."""
+    tried = _load_tried_mutations()
+    tried.add(signature)
+    TRIED_MUTATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TRIED_MUTATIONS_FILE.write_text(
+        json.dumps({"signatures": sorted(tried)}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _mutation_signature(mutation: dict) -> str:
+    """Deterministic hash of mutation fields for deduplication."""
+    key = json.dumps({k: mutation.get(k, "") for k in ("type", "path", "operation", "value")}, sort_keys=True)
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _is_crashed_result(metrics: dict) -> bool:
+    """Check if evaluation result indicates a crash or timeout."""
+    error = metrics.get("error", "")
+    if error:
+        return True
+    # If all metrics are at their worst possible values, likely a silent failure
+    if metrics.get("eval_score", 1.0) == 0.0 and metrics.get("tool_error_rate", 0.0) == 1.0:
+        return True
+    return metrics.get("latency_ms_p95", 0) == 9999
+
+
 def _run_evaluate(dry_run: bool) -> dict:
     """Run evaluate.py and return parsed metrics."""
     cmd = [sys.executable, "evaluate.py", "--output-json"]
@@ -115,14 +159,55 @@ def _run_evaluate(dry_run: bool) -> dict:
         state_dir = Path(".auto-cxas/state")
         result_path = state_dir / "last_result.json"
         if result_path.exists():
-            return json.loads(result_path.read_text("utf-8"))
+            metrics = json.loads(result_path.read_text("utf-8"))
+            # Tag crashed results so they can be identified
+            if _is_crashed_result(metrics):
+                metrics["_crashed"] = True
+            return metrics
         return {"eval_score": 0.0, "task_success": 0.0,
                 "latency_ms_p95": 9999, "tool_error_rate": 1.0,
-                "error": proc.stderr.strip()}
+                "error": proc.stderr.strip(), "_crashed": True}
     except subprocess.TimeoutExpired:
-        return {"eval_score": 0.0, "error": "evaluate.py timed out"}
+        return {"eval_score": 0.0, "error": "evaluate.py timed out", "_crashed": True}
     except Exception as exc:
-        return {"eval_score": 0.0, "error": str(exc)}
+        return {"eval_score": 0.0, "error": str(exc), "_crashed": True}
+
+
+def _run_feedback_cycle(
+    orch: AutoCXASOrchestrator,
+    bench: BenchmarkManager,
+    ingestor: FeedbackIngestor,
+    *,
+    app_name: str,
+    lookback_hours: int,
+    max_conversations: int,
+    dry_run: bool,
+) -> None:
+    """The missing eval-loop arrow: harvest failures → grow the benchmark.
+
+    1. Pull recent CX Agent Studio conversations and stage production failures.
+    2. Re-grade every staged candidate against the current agent (counts reproductions).
+    3. Auto-promote candidates that have reproduced enough times into golden_tests.yaml.
+    """
+    try:
+        new_candidates = ingestor.harvest(
+            app_name=app_name,
+            lookback_hours=lookback_hours,
+            max_conversations=max_conversations,
+        )
+        added = bench.add_candidates(new_candidates)
+        failed = bench.record_run(dry_run=dry_run)
+        promoted = bench.promote()
+    except Exception as exc:  # never let feedback harvesting break the loop
+        console.print(f"[yellow]Feedback cycle failed (non-fatal): {exc}[/yellow]")
+        return
+
+    console.print(
+        f"[magenta]Feedback:[/magenta] +{added} new candidate(s), "
+        f"{failed} reproduced this run, {len(promoted)} promoted to benchmark."
+    )
+    if promoted:
+        console.print(f"[green]Benchmark grew: {', '.join(promoted)}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +225,14 @@ def run_loop(
     configure_logging(settings.log_level)
     orch = AutoCXASOrchestrator(settings)
     _ensure_results_tsv()
+
+    # Feedback loop: failures (eval + production) become new benchmark tests.
+    bench = BenchmarkManager(
+        golden_path=GOLDEN_TESTS_FILE,
+        candidates_path=GOLDEN_CANDIDATES_FILE,
+        promote_threshold=settings.candidate_promote_threshold,
+    )
+    ingestor = FeedbackIngestor(orch.scrapi)
 
     console.print(Rule("[bold cyan]auto-cxas-scrapi autonomous loop[/bold cyan]"))
     console.print(f"  project : {settings.google_cloud_project or '[yellow]NOT SET[/yellow]'}")
@@ -194,6 +287,13 @@ def run_loop(
         console.print(f"  Hypothesis: {candidate.hypothesis}")
         console.print(f"  Mutation  : {candidate.mutation}")
 
+        # --- Deduplication: skip if this mutation signature was already tried ---
+        mut_sig = _mutation_signature(candidate.mutation)
+        tried_mutations = _load_tried_mutations()
+        if mut_sig in tried_mutations:
+            console.print(f"[yellow]Duplicate mutation detected (sig={mut_sig[:8]}...). Skipping.[/yellow]")
+            continue
+
         # --- Write new agent_config.py from planner ---
         if candidate.new_agent_config_content:
             Path("agent_config.py").write_text(candidate.new_agent_config_content, encoding="utf-8")
@@ -223,22 +323,55 @@ def run_loop(
             f"delta={delta:+.6f}"
         )
 
+        # --- Check for crashed evaluations ---
+        if metrics.get("_crashed"):
+            console.print("[red]EVALUATION CRASHED — error in evaluate.py or timeout.[/red]")
+            _git_reset_last_commit()
+            _save_tried_mutation(mut_sig)
+            status = "crashed"
+            n_discard += 1
+            desc = f"[{tag}] {candidate.title}" if tag else candidate.title
+            _append_tsv(
+                commit=exp_commit,
+                eval_score=candidate_score,
+                task_success=task_success,
+                latency_p95=latency_p95,
+                tool_error_rate=tool_error_rate,
+                status=status,
+                description=desc,
+            )
+            time.sleep(sleep_between)
+            continue
+
         # --- Keep / Discard ---
         improved = delta >= settings.min_score_delta
-        if improved and settings.approval_mode == "auto":
-            status = "keep"
-            baseline_score = candidate_score
-            n_keep += 1
-            console.print("[green]KEEP — score improved.[/green]")
-        elif improved and settings.approval_mode == "manual":
-            console.print(
-                "[yellow]Score improved but approval_mode=manual. "
-                "Run `auto-cxas promote` to apply.[/yellow]"
-            )
-            status = "keep"
-            n_keep += 1
+        if improved:
+            if settings.approval_mode == "auto":
+                status = "keep"
+                baseline_score = candidate_score
+                n_keep += 1
+                console.print("[green]KEEP — score improved.[/green]")
+                _save_tried_mutation(mut_sig)  # Still record to prevent re-trying
+            else:
+                # manual mode: log the candidate but revert the commit
+                # so the user can manually promote via CLI
+                console.print(
+                    "[yellow]Score improved but approval_mode=manual. "
+                    "Reverting — apply with `auto-cxas promote --experiment <id>`.[/yellow]"
+                )
+                _git_reset_last_commit()
+                status = "pending"
+                baseline_score = candidate_score  # Track the improved baseline score
+                n_keep += 1
         else:
+            if not dry_run:
+                console.print(
+                    "[yellow]Warning: Live revert does NOT undo changes deployed to "
+                    "CX Agent Studio. You may need to manually restore the previous "
+                    "agent configuration in the GCP console.[/yellow]"
+                )
             _git_reset_last_commit()
+            _save_tried_mutation(mut_sig)
             status = "discard"
             n_discard += 1
             console.print("[red]DISCARD — no improvement. Reverted.[/red]")
@@ -258,6 +391,19 @@ def run_loop(
             f"  [dim]keep={n_keep}  discard={n_discard}  "
             f"total={n_exp}[/dim]"
         )
+
+        # --- Feedback arrow: grow the benchmark from real failures ---
+        if settings.feedback_ingest_every > 0 and n_exp % settings.feedback_ingest_every == 0:
+            _run_feedback_cycle(
+                orch,
+                bench,
+                ingestor,
+                app_name=settings.app_name,
+                lookback_hours=settings.feedback_lookback_hours,
+                max_conversations=settings.feedback_max_conversations,
+                dry_run=dry_run,
+            )
+
         time.sleep(sleep_between)
 
     console.print(Rule("[bold green]Loop complete[/bold green]"))

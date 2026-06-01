@@ -28,6 +28,13 @@ try:
 except ImportError:
     Apps = Agents = SimulationEvals = None  # type: ignore[assignment]
 
+# Sessions is optional even within cxas-scrapi; import separately so a missing
+# Sessions class does not disable the (more common) Apps/Agents/Evals features.
+try:
+    from cxas_scrapi import Sessions  # type: ignore[import-untyped]
+except ImportError:
+    Sessions = None  # type: ignore[assignment]
+
 
 def _full_app_name(project_id: str, location: str, app_name: str) -> str:
     """Build the full CES resource name for an app."""
@@ -208,6 +215,108 @@ class ScrapiAdapter:
                 "latency_ms_p95": 0,
                 "tool_error_rate": 1.0,
             }
+
+    # ------------------------------------------------------------------
+    # Conversation history (production feedback source)
+    # ------------------------------------------------------------------
+
+    def list_recent_conversations(
+        self,
+        app_name: str = "",
+        *,
+        lookback_hours: int = 24,
+        max_conversations: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Pull recent CX Agent Studio conversations for failure harvesting.
+
+        Returns a list of normalized conversation records, each shaped::
+
+            {
+              "conversation_id": str,
+              "user_utterance": str,   # first user turn (the trigger)
+              "agent_response": str,   # agent's reply text (best-effort)
+              "intent": str,           # detected intent, if any
+              "rating": float | None,  # explicit rating if present
+              "thumbs_down": bool,     # explicit negative feedback
+              "escalated": bool,       # handed off to a human
+              "no_match": bool,        # agent failed to match/answer
+            }
+
+        Gracefully returns ``[]`` when cxas-scrapi (or its Sessions API) is
+        unavailable, mirroring the dry-run fallback used elsewhere. The
+        normalization layer below is intentionally defensive: the upstream
+        Sessions schema varies by version, so we probe several common shapes
+        and skip anything we cannot read rather than raising.
+        """
+        short = app_name or self._app_short
+        full = _full_app_name(self.project_id, self.location, short)
+
+        if Sessions is None:
+            log.info("list_recent_conversations: Sessions API unavailable — returning []")
+            return []
+
+        try:
+            client = Sessions(app_name=full)
+            raw = self._fetch_sessions(client, lookback_hours, max_conversations)
+        except Exception as exc:
+            log.warning("list_recent_conversations failed: %s", exc)
+            return []
+
+        conversations: list[dict[str, Any]] = []
+        for item in raw[:max_conversations]:
+            record = self._normalize_conversation(item)
+            if record is not None:
+                conversations.append(record)
+        return conversations
+
+    @staticmethod
+    def _fetch_sessions(client: Any, lookback_hours: int, limit: int) -> list[Any]:
+        """Call whichever listing method this Sessions version exposes."""
+        for method, kwargs in (
+            ("list_conversations", {"lookback_hours": lookback_hours, "limit": limit}),
+            ("list_sessions", {"limit": limit}),
+            ("list", {}),
+        ):
+            fn = getattr(client, method, None)
+            if fn is None:
+                continue
+            try:
+                result = fn(**kwargs)
+            except TypeError:
+                result = fn()  # method exists but doesn't accept our kwargs
+            return list(result) if result is not None else []
+        return []
+
+    @staticmethod
+    def _normalize_conversation(item: Any) -> dict[str, Any] | None:
+        """Coerce one upstream session/conversation object into our record shape."""
+        def get(obj: Any, *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if isinstance(obj, dict) and key in obj:
+                    return obj[key]
+                if hasattr(obj, key):
+                    return getattr(obj, key)
+            return default
+
+        user_utterance = get(item, "user_utterance", "query", "first_user_message", "input")
+        if not user_utterance:
+            return None  # no trigger utterance → nothing to turn into a test
+
+        rating = get(item, "rating", "score")
+        feedback = (get(item, "feedback", "user_feedback", default="") or "")
+        thumbs_down = bool(get(item, "thumbs_down", default=False)) or (
+            isinstance(feedback, str) and feedback.strip().lower() in {"negative", "thumbs_down", "bad"}
+        )
+        return {
+            "conversation_id": str(get(item, "conversation_id", "session_id", "name", default="")),
+            "user_utterance": str(user_utterance),
+            "agent_response": str(get(item, "agent_response", "response", "output", default="")),
+            "intent": str(get(item, "intent", "detected_intent", default="")),
+            "rating": float(rating) if isinstance(rating, (int | float)) else None,
+            "thumbs_down": thumbs_down,
+            "escalated": bool(get(item, "escalated", "transferred", default=False)),
+            "no_match": bool(get(item, "no_match", "fallback", default=False)),
+        }
 
     # ------------------------------------------------------------------
     # Convenience
