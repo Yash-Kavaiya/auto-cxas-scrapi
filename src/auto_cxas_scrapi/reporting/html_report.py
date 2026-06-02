@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import html
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 _STYLE = """
