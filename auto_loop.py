@@ -2,16 +2,13 @@
 """
 auto_loop.py — Autonomous experiment loop for auto-cxas-scrapi.
 
-This is the standalone script that runs the full
-  propose → commit → eval → keep/discard
-loop indefinitely (or up to --max-experiments).
-
 Usage::
 
     python auto_loop.py                          # default
     python auto_loop.py --dry-run                # no live CXAS calls
     python auto_loop.py --max-experiments 20     # stop after 20
     python auto_loop.py --tag "sprint-42"        # label runs in results.tsv
+    python auto_loop.py --ema                    # EMA-smoothed baseline (reduces noise)
 
 See program.md for the full strategy guide.
 """
@@ -24,9 +21,11 @@ import json
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 
+import git as _git
 from rich.console import Console
 from rich.rule import Rule
 
@@ -37,14 +36,18 @@ from auto_cxas_scrapi.services.orchestrator import AutoCXASOrchestrator
 
 console = Console()
 RESULTS_TSV = Path("results.tsv")
-TSV_HEADER = "commit\teval_score\ttask_success\tlatency_ms_p95\ttool_error_rate\tstatus\tdescription\ttimestamp\n"
+TSV_HEADER = (
+    "commit\teval_score\ttask_success\tlatency_ms_p95\t"
+    "tool_error_rate\tstatus\tdescription\ttimestamp\n"
+)
 TRIED_MUTATIONS_FILE = Path(".auto-cxas/state/tried_mutations.json")
 GOLDEN_TESTS_FILE = Path("golden_tests.yaml")
 GOLDEN_CANDIDATES_FILE = Path("golden_candidates.yaml")
+EMA_BETA: float = 0.7
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# TSV helpers
 # ---------------------------------------------------------------------------
 
 def _ensure_results_tsv() -> None:
@@ -71,43 +74,43 @@ def _append_tsv(
         fh.write(row)
 
 
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+def _get_repo() -> _git.Repo:
+    return _git.Repo(search_parent_directories=True)
+
+
 def _git_commit_hash() -> str:
-    """Return the current HEAD commit short hash."""
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            text=True,
-        ).strip()
+        return _get_repo().head.commit.hexsha[:7]
     except Exception:
         return "unknown"
 
 
 def _git_commit_agent_config(description: str) -> bool:
-    """Stage agent_config.py and commit.  Returns True on success."""
+    """Stage agent_config.py and create a commit. Returns True on success."""
     try:
-        subprocess.run(
-            ["git", "add", "agent_config.py"],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", f"exp: {description}"],
-            check=True, capture_output=True,
-        )
+        repo = _get_repo()
+        repo.index.add(["agent_config.py"])
+        if not repo.index.diff("HEAD"):
+            return False
+        repo.index.commit(f"exp: {description}")
         return True
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[yellow]git commit failed: {exc.stderr.decode().strip()}[/yellow]")
+    except Exception as exc:
+        console.print(f"[yellow]git commit failed: {exc}[/yellow]")
         return False
 
 
 def _git_reset_last_commit() -> None:
-    """Undo the last commit (keep working tree clean)."""
+    """Soft-reset the last commit then restore agent_config.py to HEAD."""
     try:
-        subprocess.run(
-            ["git", "reset", "--hard", "HEAD~1"],
-            check=True, capture_output=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        console.print(f"[red]git reset failed: {exc.stderr.decode().strip()}[/red]")
+        repo = _get_repo()
+        repo.git.reset("--soft", "HEAD~1")
+        repo.git.checkout("--", "agent_config.py")
+    except Exception as exc:
+        console.print(f"[red]git reset failed: {exc}[/red]")
 
 
 def _load_tried_mutations() -> set[str]:
@@ -134,7 +137,8 @@ def _save_tried_mutation(signature: str) -> None:
 
 def _mutation_signature(mutation: dict) -> str:
     """Deterministic hash of mutation fields for deduplication."""
-    key = json.dumps({k: mutation.get(k, "") for k in ("type", "path", "operation", "value")}, sort_keys=True)
+    fields = {k: mutation.get(k, "") for k in ("type", "path", "operation", "value")}
+    key = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
@@ -149,24 +153,30 @@ def _is_crashed_result(metrics: dict) -> bool:
     return metrics.get("latency_ms_p95", 0) == 9999
 
 
+# ---------------------------------------------------------------------------
+# Evaluate helper
+# ---------------------------------------------------------------------------
+
 def _run_evaluate(dry_run: bool) -> dict:
-    """Run evaluate.py and return parsed metrics."""
+    """Run evaluate.py in a subprocess and return parsed metrics."""
     cmd = [sys.executable, "evaluate.py", "--output-json"]
     if dry_run:
         cmd.append("--dry-run")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        state_dir = Path(".auto-cxas/state")
-        result_path = state_dir / "last_result.json"
+        result_path = Path(".auto-cxas/state") / "last_result.json"
         if result_path.exists():
             metrics = json.loads(result_path.read_text("utf-8"))
-            # Tag crashed results so they can be identified
+            # Tag crashed results so they can be identified downstream.
             if _is_crashed_result(metrics):
                 metrics["_crashed"] = True
             return metrics
-        return {"eval_score": 0.0, "task_success": 0.0,
-                "latency_ms_p95": 9999, "tool_error_rate": 1.0,
-                "error": proc.stderr.strip(), "_crashed": True}
+        return {
+            "eval_score": 0.0, "task_success": 0.0,
+            "latency_ms_p95": 9999, "tool_error_rate": 1.0,
+            "error": proc.stderr.strip() or "last_result.json not written",
+            "_crashed": True,
+        }
     except subprocess.TimeoutExpired:
         return {"eval_score": 0.0, "error": "evaluate.py timed out", "_crashed": True}
     except Exception as exc:
@@ -211,6 +221,72 @@ def _run_feedback_cycle(
 
 
 # ---------------------------------------------------------------------------
+# Convergence detection
+# ---------------------------------------------------------------------------
+
+def _is_converged(window: deque, threshold: float) -> bool:
+    """Return True when window is full and score range is below threshold."""
+    if len(window) < window.maxlen:  # type: ignore[arg-type]
+        return False
+    return (max(window) - min(window)) < threshold
+
+
+# ---------------------------------------------------------------------------
+# Mutation diversity tracking
+# ---------------------------------------------------------------------------
+
+def _record_mutation(mutation: dict, state_dir: Path, diversity_window: int) -> None:
+    """Append mutation type to mutation_history.json, keeping last N entries."""
+    history_path = state_dir / "mutation_history.json"
+    history: list[dict] = []
+    if history_path.exists():
+        try:
+            history = json.loads(history_path.read_text("utf-8"))
+        except Exception:
+            pass
+    history.append({
+        "type": mutation.get("type", "unknown"),
+        "path": mutation.get("path", ""),
+        "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    history = history[-diversity_window:]
+    state_dir.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Post-loop output helpers
+# ---------------------------------------------------------------------------
+
+def _maybe_generate_report(settings) -> None:
+    if not settings.generate_html_report:
+        return
+    try:
+        from auto_cxas_scrapi.reporting.html_report import generate
+        out = generate(results_tsv=RESULTS_TSV, report_dir=settings.report_dir)
+        console.print(f"[dim]HTML report → {out}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]HTML report failed: {exc}[/yellow]")
+
+
+def _maybe_export_gcs(settings) -> None:
+    bucket = getattr(settings, "gcs_results_bucket", "")
+    if not bucket or not RESULTS_TSV.exists():
+        return
+    try:
+        from google.cloud import storage as gcs
+        client = gcs.Client()
+        blob_name = (
+            f"auto-cxas-scrapi/{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}/results.tsv"
+        )
+        blob = gcs.Blob(blob_name, gcs.Bucket(client, bucket))
+        blob.upload_from_filename(str(RESULTS_TSV))
+        console.print(f"[dim]Uploaded results.tsv → gs://{bucket}/{blob_name}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]GCS export failed: {exc}[/yellow]")
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -220,11 +296,13 @@ def run_loop(
     max_experiments: int = 1000,
     dry_run: bool = False,
     sleep_between: float = 2.0,
+    use_ema: bool = False,
 ) -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     orch = AutoCXASOrchestrator(settings)
     _ensure_results_tsv()
+    state_dir = Path(settings.state_dir)
 
     # Feedback loop: failures (eval + production) become new benchmark tests.
     bench = BenchmarkManager(
@@ -235,14 +313,21 @@ def run_loop(
     ingestor = FeedbackIngestor(orch.scrapi)
 
     console.print(Rule("[bold cyan]auto-cxas-scrapi autonomous loop[/bold cyan]"))
-    console.print(f"  project : {settings.google_cloud_project or '[yellow]NOT SET[/yellow]'}")
-    console.print(f"  app     : {settings.app_name or '[yellow]NOT SET[/yellow]'}")
-    console.print(f"  llm     : {settings.llm_provider}/{settings.llm_model or 'auto'}")
-    console.print(f"  mode    : {settings.approval_mode}  dry_run={dry_run}")
-    console.print(f"  max_exp : {max_experiments}  tag={tag or 'none'}")
+    console.print(f"  project     : {settings.google_cloud_project or '[yellow]NOT SET[/yellow]'}")
+    console.print(f"  app         : {settings.app_name or '[yellow]NOT SET[/yellow]'}")
+    console.print(f"  llm         : {settings.llm_provider}/{settings.llm_model or 'auto'}")
+    console.print(f"  mode        : {settings.approval_mode}  dry_run={dry_run}")
+    console.print(f"  max_exp     : {max_experiments}  tag={tag or 'none'}")
+    console.print(f"  ema         : {use_ema} (beta={EMA_BETA})")
+    console.print(
+        f"  convergence : window={settings.convergence_window}  "
+        f"threshold={settings.convergence_threshold}"
+    )
+    console.print(
+        f"  diversity   : window={settings.diversity_window} mutation types tracked"
+    )
     console.print(Rule())
 
-    # Capture baseline once
     baseline_score = orch.get_baseline_score()
     if baseline_score == 0.0:
         console.print("[yellow]No baseline found. Running initial evaluation...[/yellow]")
@@ -260,15 +345,14 @@ def run_loop(
         )
         console.print(f"[green]Baseline: {baseline_score:.6f}[/green]")
 
-    n_exp = 0
-    n_keep = 0
-    n_discard = 0
+    smoothed_baseline = baseline_score
+    n_exp = n_keep = n_discard = 0
+    score_window: deque[float] = deque(maxlen=settings.convergence_window)
 
     while n_exp < max_experiments:
         n_exp += 1
         console.print(Rule(f"[dim]Experiment {n_exp}/{max_experiments}[/dim]"))
 
-        # --- Propose ---
         try:
             candidates = orch.propose()
         except Exception as exc:
@@ -282,24 +366,28 @@ def run_loop(
             continue
 
         candidate = candidates[0]
+        mut_type = candidate.mutation.get("type", "unknown") if candidate.mutation else "unknown"
         console.print(f"[cyan]Candidate:[/cyan] {candidate.experiment_id}")
         console.print(f"  Title     : {candidate.title}")
         console.print(f"  Hypothesis: {candidate.hypothesis}")
-        console.print(f"  Mutation  : {candidate.mutation}")
+        console.print(f"  Mutation  : {candidate.mutation}  ({mut_type})")
 
         # --- Deduplication: skip if this mutation signature was already tried ---
         mut_sig = _mutation_signature(candidate.mutation)
         tried_mutations = _load_tried_mutations()
         if mut_sig in tried_mutations:
-            console.print(f"[yellow]Duplicate mutation detected (sig={mut_sig[:8]}...). Skipping.[/yellow]")
+            console.print(
+                f"[yellow]Duplicate mutation detected (sig={mut_sig[:8]}...). Skipping.[/yellow]"
+            )
             continue
 
         # --- Write new agent_config.py from planner ---
         if candidate.new_agent_config_content:
-            Path("agent_config.py").write_text(candidate.new_agent_config_content, encoding="utf-8")
+            Path("agent_config.py").write_text(
+                candidate.new_agent_config_content, encoding="utf-8"
+            )
             console.print("[dim]Wrote new agent_config.py from planner.[/dim]")
 
-        # --- Commit mutation ---
         committed = _git_commit_agent_config(candidate.title)
         if not committed:
             console.print("[yellow]Nothing to commit (no diff). Skipping.[/yellow]")
@@ -308,18 +396,18 @@ def run_loop(
 
         exp_commit = _git_commit_hash()
 
-        # --- Evaluate ---
         console.print("[dim]Running evaluate.py...[/dim]")
         metrics = _run_evaluate(dry_run)
         candidate_score = metrics.get("eval_score", 0.0)
-        task_success = metrics.get("task_success", 0.0)
-        latency_p95 = metrics.get("latency_ms_p95", 0)
+        task_success    = metrics.get("task_success", 0.0)
+        latency_p95     = metrics.get("latency_ms_p95", 0)
         tool_error_rate = metrics.get("tool_error_rate", 0.0)
 
-        delta = candidate_score - baseline_score
+        compare_baseline = smoothed_baseline if use_ema else baseline_score
+        delta = candidate_score - compare_baseline
         console.print(
             f"  [bold]score[/bold]={candidate_score:.6f}  "
-            f"baseline={baseline_score:.6f}  "
+            f"baseline={compare_baseline:.6f}  "
             f"delta={delta:+.6f}"
         )
 
@@ -345,24 +433,28 @@ def run_loop(
 
         # --- Keep / Discard ---
         improved = delta >= settings.min_score_delta
-        if improved:
-            if settings.approval_mode == "auto":
-                status = "keep"
-                baseline_score = candidate_score
-                n_keep += 1
-                console.print("[green]KEEP — score improved.[/green]")
-                _save_tried_mutation(mut_sig)  # Still record to prevent re-trying
-            else:
-                # manual mode: log the candidate but revert the commit
-                # so the user can manually promote via CLI
-                console.print(
-                    "[yellow]Score improved but approval_mode=manual. "
-                    "Reverting — apply with `auto-cxas promote --experiment <id>`.[/yellow]"
+        if improved and settings.approval_mode == "auto":
+            status = "keep"
+            if use_ema:
+                smoothed_baseline = (
+                    EMA_BETA * smoothed_baseline + (1 - EMA_BETA) * candidate_score
                 )
-                _git_reset_last_commit()
-                status = "pending"
-                baseline_score = candidate_score  # Track the improved baseline score
-                n_keep += 1
+            else:
+                baseline_score = candidate_score
+            n_keep += 1
+            console.print("[green]KEEP — score improved.[/green]")
+            _save_tried_mutation(mut_sig)  # Still record to prevent re-trying
+        elif improved and settings.approval_mode == "manual":
+            # manual mode: log the candidate but revert the commit
+            # so the user can manually promote via CLI
+            console.print(
+                "[yellow]Score improved but approval_mode=manual. "
+                "Reverting — apply with `auto-cxas promote --experiment <id>`.[/yellow]"
+            )
+            _git_reset_last_commit()
+            status = "pending"
+            baseline_score = candidate_score  # Track the improved baseline score
+            n_keep += 1
         else:
             if not dry_run:
                 console.print(
@@ -376,6 +468,12 @@ def run_loop(
             n_discard += 1
             console.print("[red]DISCARD — no improvement. Reverted.[/red]")
 
+        # Record mutation type for diversity tracking
+        if candidate.mutation:
+            _record_mutation(candidate.mutation, state_dir, settings.diversity_window)
+
+        score_window.append(candidate_score)
+
         desc = f"[{tag}] {candidate.title}" if tag else candidate.title
         _append_tsv(
             commit=exp_commit,
@@ -386,6 +484,15 @@ def run_loop(
             status=status,
             description=desc,
         )
+        console.print(f"  [dim]keep={n_keep}  discard={n_discard}  total={n_exp}[/dim]")
+
+        if _is_converged(score_window, settings.convergence_threshold):
+            console.print(
+                f"[bold yellow]CONVERGED[/bold yellow] — last "
+                f"{settings.convergence_window} experiments span < "
+                f"{settings.convergence_threshold:.4f}. Stopping."
+            )
+            break
 
         console.print(
             f"  [dim]keep={n_keep}  discard={n_discard}  "
@@ -410,7 +517,11 @@ def run_loop(
     console.print(f"  experiments : {n_exp}")
     console.print(f"  keep        : {n_keep}")
     console.print(f"  discard     : {n_discard}")
-    console.print(f"  final score : {baseline_score:.6f}")
+    final = smoothed_baseline if use_ema else baseline_score
+    console.print(f"  final score : {final:.6f}")
+
+    _maybe_generate_report(settings)
+    _maybe_export_gcs(settings)
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +539,8 @@ def _parse_args() -> argparse.Namespace:
                     help="Use dry-run evaluate.py (no live CXAS calls)")
     ap.add_argument("--sleep", type=float, default=2.0,
                     help="Seconds between experiments")
+    ap.add_argument("--ema", action="store_true",
+                    help="EMA-smooth the baseline score to reduce eval noise")
     return ap.parse_args()
 
 
@@ -439,6 +552,7 @@ if __name__ == "__main__":
             max_experiments=args.max_experiments,
             dry_run=args.dry_run,
             sleep_between=args.sleep,
+            use_ema=args.ema,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/yellow]")

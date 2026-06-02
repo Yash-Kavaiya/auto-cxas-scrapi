@@ -24,7 +24,11 @@ def test_perfect_score() -> None:
 
 def test_zero_score() -> None:
     scorer = WeightedScorer()
-    sc = scorer.score(_result(0.0, 5000, 1.0))
+    result = _result(0.0, 5000, 1.0)
+    # guardrail_pass_rate defaults to 1.0 when absent; pin every dimension to 0
+    # so the score is a true floor of 0.0.
+    result.artifacts["simulation_summary"]["guardrail_pass_rate"] = 0.0
+    sc = scorer.score(result)
     assert sc.score == 0.0
 
 

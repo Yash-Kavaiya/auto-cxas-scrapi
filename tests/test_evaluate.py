@@ -20,13 +20,30 @@ def _load_evaluate():
 
 def test_compute_eval_score_perfect() -> None:
     mod = _load_evaluate()
-    score = mod._compute_eval_score(1.0, 0, 0.0)
+    metrics = {
+        "task_success": 1.0,
+        "turn_pass_rate": 1.0,
+        "tool_pass_rate": 1.0,
+        "guardrail_pass_rate": 1.0,
+        "callback_pass_rate": 1.0,
+    }
+    score = mod._compute_eval_score(metrics, 0)
     assert score == 1.0
 
 
 def test_compute_eval_score_zero() -> None:
     mod = _load_evaluate()
-    score = mod._compute_eval_score(0.0, 5000, 1.0)
+    # All eval dimensions fail and latency is maxed out. guardrail_pass_rate
+    # defaults to 1.0 (an empty guardrail set is "nothing wrongly blocked"),
+    # so the floor score is its 0.07 weight, not 0.0.
+    metrics = {
+        "task_success": 0.0,
+        "turn_pass_rate": 0.0,
+        "tool_pass_rate": 0.0,
+        "guardrail_pass_rate": 0.0,
+        "callback_pass_rate": 0.0,
+    }
+    score = mod._compute_eval_score(metrics, 5000)
     assert score == 0.0
 
 

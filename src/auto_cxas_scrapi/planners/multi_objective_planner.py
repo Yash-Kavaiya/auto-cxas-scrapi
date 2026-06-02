@@ -1,14 +1,12 @@
 """Multi-objective planner utilities — eval ranking and score utilities.
 
-Module-level functions are used by LLMOptimizationPlanner to determine
-which eval dimension to target next.
-
-Priority order (configurable):
-  1. simulation   — task_success     (weight: 0.60)
-  2. tool         — tool_pass_rate   (weight: 0.25)
-  3. turn         — turn_pass_rate   (weight: 0.10)
-  4. guardrail    — guardrail_pass_rate (weight: 0.03)
-  5. callback     — callback_pass_rate  (weight: 0.02)
+Weights match WeightedScorer and evaluate.py._compute_eval_score:
+  simulation  task_success      0.35
+  turn        turn_pass_rate    0.20
+  tool        tool_pass_rate    0.20
+  latency     (implicit)        0.15
+  guardrail   guardrail_pass_rate 0.07
+  callback    callback_pass_rate  0.03
 """
 
 from __future__ import annotations
@@ -21,19 +19,17 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-# Default weights matching weighted.py scorer
 EVAL_WEIGHTS: list[tuple[str, str, float]] = [
-    # (eval_type, metric_key_in_scorecard, weight)
-    ("simulation", "task_success", 0.60),
-    ("tool", "tool_pass_rate", 0.25),
-    ("turn", "turn_pass_rate", 0.10),
-    ("guardrail", "guardrail_pass_rate", 0.03),
-    ("callback", "callback_pass_rate", 0.02),
+    ("simulation", "task_success",        0.35),
+    ("turn",       "turn_pass_rate",       0.20),
+    ("tool",       "tool_pass_rate",       0.20),
+    ("guardrail",  "guardrail_pass_rate",  0.07),
+    ("callback",   "callback_pass_rate",   0.03),
 ]
 
 
 def load_last_metrics(state_dir: Path) -> dict[str, float]:
-    """Load metric scores from last_result.json; returns {} on any failure."""
+    """Load metric scores from last_result.json; returns {} on failure."""
     result_path = state_dir / "last_result.json"
     if not result_path.exists():
         return {}
@@ -50,9 +46,9 @@ def rank_eval_types(
     metrics: dict[str, float],
     weights: list[tuple[str, str, float]] | None = None,
 ) -> list[tuple[str, str, float]]:
-    """Return eval dimensions sorted by score ascending (worst first).
+    """Return eval dimensions sorted ascending by score (worst first).
 
-    Each entry is (eval_type, metric_key, current_score).
+    Each entry: (eval_type, metric_key, current_score).
     """
     w = weights or EVAL_WEIGHTS
     ranked = [
@@ -64,15 +60,14 @@ def rank_eval_types(
 
 @dataclass
 class MultiObjectiveCandidate:
-    """A proposed experiment targeting a specific eval dimension."""
     experiment_id: str
     title: str
     hypothesis: str
-    target_eval: str          # simulation | tool | turn | guardrail | callback
-    target_metric: str        # the specific metric being improved
-    current_score: float      # score for this metric in the last run
+    target_eval: str
+    target_metric: str
+    current_score: float
     mutation: dict[str, Any]
-    priority: int             # 1 = highest priority target
+    priority: int
     rationale: str
     parent_experiment_id: str = ""
     tags: list[str] = field(default_factory=list)
@@ -94,12 +89,7 @@ class MultiObjectiveCandidate:
 
 
 class MultiObjectivePlanner:
-    """Utility class for multi-objective eval targeting.
-
-    propose() has been removed; use LLMOptimizationPlanner for candidate
-    generation.  This class retains top_priority_eval() and score_summary()
-    as convenience helpers.
-    """
+    """Utility class for multi-objective eval targeting."""
 
     def __init__(
         self,
@@ -110,12 +100,10 @@ class MultiObjectivePlanner:
         self.eval_weights = eval_weights or EVAL_WEIGHTS
 
     def top_priority_eval(self) -> str:
-        """Return the eval type with the lowest current score."""
         ranked = rank_eval_types(load_last_metrics(self.state_dir), self.eval_weights)
         return ranked[0][0] if ranked else "simulation"
 
     def score_summary(self) -> dict[str, float]:
-        """Return current metric scores for all 5 eval dimensions."""
         last_metrics = load_last_metrics(self.state_dir)
         return {
             metric_key: last_metrics.get(metric_key, 0.0)

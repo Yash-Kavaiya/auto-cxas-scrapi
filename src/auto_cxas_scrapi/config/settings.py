@@ -29,8 +29,8 @@ class Settings(BaseSettings):
     )
     min_score_delta: float = Field(default=0.01, alias="AUTO_CXAS_MIN_SCORE_DELTA")
     max_experiments_per_loop: int = Field(default=1000, alias="AUTO_CXAS_MAX_EXPERIMENTS_PER_LOOP")
-    max_parallel_evals: int = Field(default=2, alias="AUTO_CXAS_MAX_PARALLEL_EVALS")
-    eval_timeout_seconds: int = Field(default=120, alias="AUTO_CXAS_EVAL_TIMEOUT_SECONDS")
+    max_parallel_evals: int = Field(default=3, alias="AUTO_CXAS_MAX_PARALLEL_EVALS")
+    eval_timeout_seconds: int = Field(default=180, alias="AUTO_CXAS_EVAL_TIMEOUT_SECONDS")
     baseline_cache_ttl_seconds: int = Field(
         default=300, alias="AUTO_CXAS_BASELINE_CACHE_TTL_SECONDS"
     )
@@ -48,10 +48,25 @@ class Settings(BaseSettings):
     feedback_max_conversations: int = Field(
         default=200, alias="AUTO_CXAS_FEEDBACK_MAX_CONVERSATIONS"
     )
+    # Convergence detection
+    convergence_window: int = Field(default=10, alias="AUTO_CXAS_CONVERGENCE_WINDOW")
+    convergence_threshold: float = Field(default=0.002, alias="AUTO_CXAS_CONVERGENCE_THRESHOLD")
+    # Mutation diversity enforcement
+    diversity_window: int = Field(default=5, alias="AUTO_CXAS_DIVERSITY_WINDOW")
+    # Callback server
+    callback_server_url: str = Field(default="", alias="AUTO_CXAS_CALLBACK_SERVER_URL")
+    callback_secret: str = Field(default="", alias="AUTO_CXAS_CALLBACK_SECRET")
+    # Reporting
+    generate_html_report: bool = Field(default=False, alias="AUTO_CXAS_GENERATE_HTML_REPORT")
+    report_dir: Path = Field(default=Path(".auto-cxas/reports"), alias="AUTO_CXAS_REPORT_DIR")
+    # GCS export
+    gcs_results_bucket: str = Field(default="", alias="AUTO_CXAS_GCS_RESULTS_BUCKET")
 
     def ensure_directories(self) -> None:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        if self.generate_html_report:
+            self.report_dir.mkdir(parents=True, exist_ok=True)
 
 
 def get_settings() -> Settings:
